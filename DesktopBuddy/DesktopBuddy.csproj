@@ -14,6 +14,7 @@
 
   <ItemGroup>
     <PackageReference Include="Lib.Harmony" Version="2.3.3" />
+    <PackageReference Include="ILRepack.Lib.MSBuild.Task" Version="2.0.34" />
   </ItemGroup>
 
   <ItemGroup>
@@ -59,12 +60,22 @@
     </Reference>
   </ItemGroup>
 
-  <!-- Copy to rml_mods after build (ContinueOnError so build succeeds even if Resonite is running) -->
-  <Target Name="CopyToResonite" AfterTargets="Build">
+  <!-- Compile HLSL shaders at build time and embed as resources -->
+  <PropertyGroup>
+    <FxcPath>$([MSBuild]::GetDirectoryNameOfFileAbove('$(MSBuildThisFileDirectory)', '*.csproj'))\..\</FxcPath>
+  </PropertyGroup>
+
+  <Target Name="CompileShaders" BeforeTargets="BeforeBuild">
+    <Exec Command="&quot;C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\fxc.exe&quot; /T cs_5_0 /E CSMain /O3 /Fo &quot;$(IntermediateOutputPath)BgraToRgba.cso&quot; &quot;$(MSBuildThisFileDirectory)Shaders\BgraToRgba.hlsl&quot;" />
+  </Target>
+
+  <ItemGroup>
+    <EmbeddedResource Include="$(IntermediateOutputPath)BgraToRgba.cso" LogicalName="DesktopBuddy.Shaders.BgraToRgba.cso" />
+  </ItemGroup>
+
+  <!-- Copy merged DLL to rml_mods -->
+  <Target Name="CopyToResonite" AfterTargets="ILRepackMerge">
     <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(ResonitePath)\rml_mods" ContinueOnError="true" />
-    <Copy SourceFiles="$(TargetDir)Microsoft.Windows.SDK.NET.dll" DestinationFolder="$(ResonitePath)\rml_mods" ContinueOnError="true" />
-    <Copy SourceFiles="$(TargetDir)WinRT.Runtime.dll" DestinationFolder="$(ResonitePath)\rml_mods" ContinueOnError="true" />
-    <Copy SourceFiles="$(TargetDir)NvEncSharp.dll" DestinationFolder="$(ResonitePath)\rml_mods" ContinueOnError="true" />
   </Target>
 
 </Project>

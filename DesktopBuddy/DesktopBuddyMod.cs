@@ -47,6 +47,7 @@ public class DesktopBuddyMod : ResoniteMod
     internal static MjpegServer? StreamServer;
     private const int STREAM_PORT = 48080;
     internal static string? TunnelUrl; // Set by cloudflared if available
+    internal static readonly PerfTimer Perf = new();
 
     public override void OnEngineInit()
     {
@@ -136,7 +137,7 @@ public class DesktopBuddyMod : ResoniteMod
         displayVis.Default.Value = false; // Other users: hidden
         displayVis.CreateOverrideOnWrite.Value = false;
         displayVis.SetOverride(root.World.LocalUser, true); // Spawner: visible
-        Msg("[StartStreaming] Display per-user visibility set (local=true, others=false)");
+        Msg("[StartStreaming] Per-user visibility set");
 
         // SolidColorTexture as our procedural texture host
         var texSlot = displaySlot.AddSlot("Texture");
@@ -151,7 +152,7 @@ public class DesktopBuddyMod : ResoniteMod
         float canvasScale = 0.001f;
         var ui = new UIBuilder(displaySlot, w, h, canvasScale);
         var rawImage = ui.RawImage(procTex);
-        Msg("[StartStreaming] Canvas + RawImage created on display slot");
+        Msg("[StartStreaming] Canvas + RawImage created");
 
         // Opaque material so the texture isn't transparent
         var mat = displaySlot.AttachComponent<UI_UnlitMaterial>();
@@ -162,7 +163,7 @@ public class DesktopBuddyMod : ResoniteMod
         var btn = rawImage.Slot.AttachComponent<Button>();
         btn.PassThroughHorizontalMovement.Value = false;
         btn.PassThroughVerticalMovement.Value = false;
-        Msg("[StartStreaming] Button attached to RawImage");
+        Msg("[StartStreaming] Button attached");
 
         // Create session early so event handlers can reference it
         var session = new DesktopSession
@@ -192,7 +193,7 @@ public class DesktopBuddyMod : ResoniteMod
         {
             if (source != session.LastActiveSource)
             {
-                Msg($"[Input] Source claimed by {reason} (source={source?.GetType().Name})");
+                // Source claimed
                 session.LastActiveSource = source;
             }
         }
@@ -230,7 +231,7 @@ public class DesktopBuddyMod : ResoniteMod
         // Hover enter: focus window only if this is the active source
         btn.LocalHoverEnter += (IButton b, ButtonEventData data) =>
         {
-            Msg($"[HoverEnter] source={data.source?.GetType().Name} isActive={IsActiveSource(data.source)}");
+            // HoverEnter
         };
 
         // Touch down — replaces mouse click for drag-to-scroll, hold-to-right-click, multi-touch
@@ -240,7 +241,7 @@ public class DesktopBuddyMod : ResoniteMod
             float u = data.normalizedPressPoint.x;
             float v = 1f - data.normalizedPressPoint.y;
             uint touchId = GetTouchId(data.source);
-            Msg($"[Touch] Down u={u:F3} v={v:F3} id={touchId}");
+            // Touch down
             WindowInput.FocusWindow(hwnd);
             WindowInput.SendTouchDown(hwnd, u, v, streamer.Width, streamer.Height, touchId);
         };
@@ -260,7 +261,7 @@ public class DesktopBuddyMod : ResoniteMod
             float u = data.normalizedPressPoint.x;
             float v = 1f - data.normalizedPressPoint.y;
             uint touchId = GetTouchId(data.source);
-            Msg($"[Touch] Up u={u:F3} v={v:F3} id={touchId}");
+            // Touch up
             WindowInput.SendTouchUp(hwnd, u, v, streamer.Width, streamer.Height, touchId);
         };
 
@@ -297,7 +298,7 @@ public class DesktopBuddyMod : ResoniteMod
                 if (handler == null && !session.JoystickDiagLogged)
                 {
                     session.JoystickDiagLogged = true;
-                    Msg($"[Scroll] DIAG: handler=null even via FindHandler, source={data.source?.GetType().Name}, slot={data.source?.Slot?.Name}");
+                    // Scroll diag: handler null
                 }
                 if (handler != null)
                 {
@@ -306,7 +307,7 @@ public class DesktopBuddyMod : ResoniteMod
                     if (controller == null && !session.JoystickDiagLogged)
                     {
                         session.JoystickDiagLogged = true;
-                        Msg($"[Scroll] DIAG: controller=null for side={side}, VR_Active={root.World.InputInterface.VR_Active}");
+                        // Scroll diag: controller null
                     }
                     if (controller != null)
                     {
@@ -314,7 +315,7 @@ public class DesktopBuddyMod : ResoniteMod
                         if (!session.JoystickDiagLogged)
                         {
                             session.JoystickDiagLogged = true;
-                            Msg($"[Scroll] DIAG: side={side} controller={controller.DeviceModel} axisY={axisY:F4} VR_Active={root.World.InputInterface.VR_Active}");
+                            // Scroll diag: first read
                         }
                         if (Math.Abs(axisY) > 0.15f)
                         {
@@ -717,15 +718,13 @@ public class DesktopBuddyMod : ResoniteMod
         // Grabbable with scaling enabled — normalizedPressPoint is 0-1 so input is scale-independent
         var grabbable = root.AttachComponent<Grabbable>();
         grabbable.Scalable.Value = true;
-        Msg("[StartStreaming] Grabbable attached with Scalable=true");
+        Msg("[StartStreaming] Grabbable attached");
 
         root.PersistentSelf = false;
         root.Name = $"Desktop: {title}";
 
         // Start update loop in this world
-        Msg("[StartStreaming] Scheduling update loop...");
         ScheduleUpdate(root.World);
-        Msg("[StartStreaming] Update loop scheduled.");
 
         // Focus the window in Windows immediately so user can start using it
         WindowInput.FocusWindow(hwnd);
@@ -743,12 +742,32 @@ public class DesktopBuddyMod : ResoniteMod
 
     private static int _updateCount;
 
-    // Cached reflection — looked up once, used every frame
-    private static readonly PropertyInfo _tex2DProp = typeof(ProceduralTextureBase)
-        .GetProperty("tex2D", BindingFlags.NonPublic | BindingFlags.Instance);
-    private static readonly MethodInfo _setFromBitmapMethod = typeof(ProceduralTextureBase)
-        .GetMethod("SetFromCurrentBitmap", BindingFlags.NonPublic | BindingFlags.Instance);
-    private static readonly object[] _uploadArgs = new object[] { new Renderite.Shared.TextureUploadHint(), null };
+    // Cached reflection — looked up once, compiled to delegates for zero-overhead per-frame calls
+    private static readonly Func<ProceduralTextureBase, Bitmap2D> _getTex2D;
+    private static readonly Action<ProceduralTextureBase, Renderite.Shared.TextureUploadHint, FrooxEngine.AssetIntegrated> _setFromBitmap;
+
+    private delegate void SetFromCurrentBitmapDelegate(ProceduralTextureBase instance, Renderite.Shared.TextureUploadHint hint, FrooxEngine.AssetIntegrated callback);
+
+    static DesktopBuddyMod()
+    {
+        var tex2DGetter = typeof(ProceduralTextureBase)
+            .GetProperty("tex2D", BindingFlags.NonPublic | BindingFlags.Instance)
+            ?.GetGetMethod(true);
+        if (tex2DGetter != null)
+            _getTex2D = (Func<ProceduralTextureBase, Bitmap2D>)Delegate.CreateDelegate(
+                typeof(Func<ProceduralTextureBase, Bitmap2D>), tex2DGetter);
+
+        var setMethod = typeof(ProceduralTextureBase)
+            .GetMethod("SetFromCurrentBitmap", BindingFlags.NonPublic | BindingFlags.Instance);
+        if (setMethod != null)
+            _setFromBitmap = (Action<ProceduralTextureBase, Renderite.Shared.TextureUploadHint, FrooxEngine.AssetIntegrated>)
+                Delegate.CreateDelegate(
+                    typeof(Action<ProceduralTextureBase, Renderite.Shared.TextureUploadHint, FrooxEngine.AssetIntegrated>),
+                    setMethod);
+
+        Msg("[DesktopBuddyMod] Compiled reflection delegates: " +
+            $"getTex2D={_getTex2D != null}, setFromBitmap={_setFromBitmap != null}");
+    }
 
     private static readonly Stopwatch _perfSw = new();
 
@@ -860,27 +879,22 @@ public class DesktopBuddyMod : ResoniteMod
                     continue; // Skip this frame, let texture recreate
                 }
 
-                var bitmap = _tex2DProp?.GetValue(session.Texture) as Bitmap2D;
+                var bitmap = _getTex2D?.Invoke(session.Texture);
                 if (bitmap == null || bitmap.Size.x != w || bitmap.Size.y != h)
                 {
                     if (_updateCount <= 10) Msg($"[UpdateLoop] Bitmap null or size mismatch, waiting...");
                     continue;
                 }
 
-                _perfSw.Restart();
+                // Copy frame into bitmap
+                using (Perf.Time("bitmap_copy"))
+                    frame.AsSpan(0, w * h * 4).CopyTo(bitmap.RawData);
 
-                // WGC: already BGRA + Y-flipped from callback, straight memcpy
-                frame.AsSpan(0, w * h * 4).CopyTo(bitmap.RawData);
+                // Upload to GPU
+                using (Perf.Time("texture_upload"))
+                    _setFromBitmap?.Invoke(session.Texture, default, null);
 
-                _setFromBitmapMethod?.Invoke(session.Texture, _uploadArgs);
-
-                _perfSw.Stop();
-                if (_updateCount <= 5 || _updateCount % 300 == 0)
-                {
-                    Msg($"[UpdateLoop] tick #{_updateCount}, sessions={ActiveSessions.Count}, " +
-                        $"captured={session.Streamer.FramesCaptured}, {w}x{h}, " +
-                        $"copy+upload={_perfSw.Elapsed.TotalMilliseconds:F1}ms, wgc={session.Streamer.UsingWgc}");
-                }
+                Perf.IncrementFrames();
             }
         }
         catch (Exception ex)
@@ -1143,20 +1157,20 @@ static class SimulatePressPatch
             {
                 // Modifier: hold down (don't release — will be released when shift state changes)
                 WindowInput.SendVirtualKeyDown(vk);
-                DesktopBuddyMod.Msg($"[Keyboard] Modifier DOWN: {key} -> VK 0x{vk:X2}");
+                // Modifier down
             }
             else
             {
                 // Regular key: press and release
                 WindowInput.SendVirtualKey(vk);
-                DesktopBuddyMod.Msg($"[Keyboard] Key press: {key} -> VK 0x{vk:X2}");
+                // Key press
                 // Release any held modifiers after the key press
                 WindowInput.ReleaseAllModifiers();
             }
         }
         else
         {
-            DesktopBuddyMod.Msg($"[Keyboard] Unmapped key: {key}");
+            // Unmapped key ignored
         }
 
         return false; // Block Resonite

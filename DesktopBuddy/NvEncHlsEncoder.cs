@@ -32,6 +32,7 @@ public sealed class NvEncHlsEncoder : IDisposable
     private byte[] _ringBuffer;
     private long _ringWritePos;
     private readonly object _ringLock = new();
+    private readonly SemaphoreSlim _dataAvailable = new(0, 1);
 
     private uint _width, _height;
     private int _totalFrames;
@@ -39,11 +40,28 @@ public sealed class NvEncHlsEncoder : IDisposable
     private long _lastFrameTicks; // For detecting pauses
     private const long PAUSE_THRESHOLD_TICKS = TimeSpan.TicksPerSecond / 5; // 200ms = pause, force IDR for decoder resync
 
+    // Cached NVENC resource registration — avoids register/unregister per frame
+    private IntPtr _cachedTexturePtr;
+    private NvEncRegisterResource _cachedReg;
+    private IDisposable _cachedRegistration;
+
     private const int RING_SIZE = 4 * 1024 * 1024; // 4MB ring buffer
 
     public string HlsDir => _hlsDir;
     public bool IsInitialized => _initialized;
     public bool IsRunning => _initialized && _ffmpeg != null && !_ffmpeg.HasExited;
+
+    /// <summary>Wait for new data to arrive (up to timeoutMs).</summary>
+    public void WaitForData(int timeoutMs)
+    {
+        _dataAvailable.Wait(timeoutMs);
+    }
+
+    /// <summary>Async wait for new data to arrive (up to timeoutMs).</summary>
+    public async System.Threading.Tasks.Task WaitForDataAsync(int timeoutMs)
+    {
+        await _dataAvailable.WaitAsync(timeoutMs);
+    }
 
     /// <summary>
     /// Read MPEG-TS data from the ring buffer. Returns bytes read.
@@ -52,22 +70,23 @@ public sealed class NvEncHlsEncoder : IDisposable
     private const byte MPEGTS_SYNC = 0x47;
     private const int MPEGTS_PACKET_SIZE = 188;
 
-    public int ReadStream(byte[] buffer, ref long readPos)
+    public int ReadStream(byte[] buffer, ref long readPos, ref bool aligned)
     {
         lock (_ringLock)
         {
             long available = _ringWritePos - readPos;
             if (available <= 0) return 0;
 
-            // If client is too far behind, skip to latest data
+            // If client is too far behind, skip to latest data and re-align
             if (available > RING_SIZE)
             {
                 readPos = _ringWritePos - RING_SIZE;
                 available = RING_SIZE;
+                aligned = false;
             }
 
-            // First read: align to MPEG-TS packet boundary (find 0x47 sync byte)
-            if (readPos == 0 || available > RING_SIZE / 2)
+            // First read or after skip: align to MPEG-TS packet boundary (find 0x47 sync byte)
+            if (!aligned)
             {
                 long searchStart = readPos;
                 bool found = false;
@@ -83,6 +102,7 @@ public sealed class NvEncHlsEncoder : IDisposable
                             readPos = s;
                             available = _ringWritePos - readPos;
                             found = true;
+                            aligned = true;
                             break;
                         }
                     }
@@ -91,10 +111,11 @@ public sealed class NvEncHlsEncoder : IDisposable
             }
 
             int toRead = (int)Math.Min(available, buffer.Length);
-            for (int i = 0; i < toRead; i++)
-            {
-                buffer[i] = _ringBuffer[(int)((readPos + i) % RING_SIZE)];
-            }
+            int ringPos = (int)(readPos % RING_SIZE);
+            int firstChunk = Math.Min(toRead, RING_SIZE - ringPos);
+            Buffer.BlockCopy(_ringBuffer, ringPos, buffer, 0, firstChunk);
+            if (firstChunk < toRead)
+                Buffer.BlockCopy(_ringBuffer, 0, buffer, firstChunk, toRead - firstChunk);
             readPos += toRead;
             return toRead;
         }
@@ -182,6 +203,33 @@ public sealed class NvEncHlsEncoder : IDisposable
         }
     }
 
+    private void Reinitialize(IntPtr d3dDevice, uint width, uint height)
+    {
+        try
+        {
+            // Tear down old encoder + FFmpeg
+            _initialized = false;
+            try { _cachedRegistration?.Dispose(); _cachedRegistration = null; _cachedTexturePtr = IntPtr.Zero; } catch { }
+            try { _ffmpegStdin?.Close(); } catch { }
+            try { if (_ffmpeg != null && !_ffmpeg.HasExited) _ffmpeg.Kill(); } catch { }
+            try { _encoder.DestroyBitstreamBuffer(_bitstreamBuffer.BitstreamBuffer); } catch { }
+            try { _encoder.DestroyEncoder(); } catch { }
+
+            // Reset state
+            _initFailed = false;
+            _totalFrames = 0;
+
+            // Re-initialize at new size
+            if (!Initialize(d3dDevice, width, height))
+                ResoniteMod.Msg($"[NvEnc:{_streamId}] Reinitialize FAILED at {width}x{height}");
+        }
+        catch (Exception ex)
+        {
+            ResoniteMod.Msg($"[NvEnc:{_streamId}] Reinitialize error: {ex}");
+            _initFailed = true;
+        }
+    }
+
     private void StartFfmpegMuxer(uint width, uint height, bool hevc)
     {
         var ffmpegPath = MjpegServer.FindFfmpeg();
@@ -215,7 +263,7 @@ public sealed class NvEncHlsEncoder : IDisposable
         _ffmpeg.BeginErrorReadLine();
         _ffmpegStdin = _ffmpeg.StandardInput.BaseStream;
 
-        ResoniteMod.Msg($"[NvEnc:{_streamId}] FFmpeg muxer PID={ffmpegPid}, stdin ready={_ffmpegStdin.CanWrite}");
+        ResoniteMod.Msg($"[NvEnc:{_streamId}] FFmpeg muxer PID={ffmpegPid}");
 
         // Drain FFmpeg stdout into ring buffer continuously — prevents stdout from filling and blocking
         _ringBuffer = new byte[RING_SIZE];
@@ -232,12 +280,14 @@ public sealed class NvEncHlsEncoder : IDisposable
                     if (read <= 0) break;
                     lock (_ringLock)
                     {
-                        for (int i = 0; i < read; i++)
-                        {
-                            _ringBuffer[(int)(_ringWritePos % RING_SIZE)] = buf[i];
-                            _ringWritePos++;
-                        }
+                        int ringPos = (int)(_ringWritePos % RING_SIZE);
+                        int firstChunk = Math.Min(read, RING_SIZE - ringPos);
+                        Buffer.BlockCopy(buf, 0, _ringBuffer, ringPos, firstChunk);
+                        if (firstChunk < read)
+                            Buffer.BlockCopy(buf, firstChunk, _ringBuffer, 0, read - firstChunk);
+                        _ringWritePos += read;
                     }
+                    if (_dataAvailable.CurrentCount == 0) try { _dataAvailable.Release(); } catch { }
                 }
                 ResoniteMod.Msg($"[NvEnc:{_streamId}] Drain thread ended, total bytes: {_ringWritePos}");
             }
@@ -257,12 +307,12 @@ public sealed class NvEncHlsEncoder : IDisposable
     {
         if (_initFailed) return;
         if (!_initialized) return;
-        // Allow original odd dimensions (NVENC rounds internally)
+        // Resolution changed — reinitialize encoder + FFmpeg muxer
         if ((width & ~1u) != _width || (height & ~1u) != _height)
         {
-            if (_totalFrames == 0)
-                ResoniteMod.Msg($"[NvEnc:{_streamId}] Skipping frame: size mismatch init={_width}x{_height} frame={width}x{height}");
-            return;
+            ResoniteMod.Msg($"[NvEnc:{_streamId}] Resolution changed {_width}x{_height} -> {width}x{height}, reinitializing");
+            Reinitialize(srcTexture, width, height);
+            if (!_initialized) return;
         }
         if (_ffmpeg == null || _ffmpeg.HasExited)
         {
@@ -272,18 +322,24 @@ public sealed class NvEncHlsEncoder : IDisposable
 
         try
         {
-            var reg = new NvEncRegisterResource
+            // Cache NVENC resource registration — texture pointer only changes on resolution change
+            if (srcTexture != _cachedTexturePtr)
             {
-                Version = NV_ENC_REGISTER_RESOURCE_VER,
-                BufferFormat = NvEncBufferFormat.Argb,
-                BufferUsage = NvEncBufferUsage.NvEncInputImage,
-                ResourceToRegister = srcTexture,
-                Width = width,
-                Height = height,
-                Pitch = 0
-            };
-
-            using var registration = _encoder.RegisterResource(ref reg);
+                _cachedRegistration?.Dispose();
+                _cachedReg = new NvEncRegisterResource
+                {
+                    Version = NV_ENC_REGISTER_RESOURCE_VER,
+                    BufferFormat = NvEncBufferFormat.Argb,
+                    BufferUsage = NvEncBufferUsage.NvEncInputImage,
+                    ResourceToRegister = srcTexture,
+                    Width = width,
+                    Height = height,
+                    Pitch = 0
+                };
+                _cachedRegistration = _encoder.RegisterResource(ref _cachedReg);
+                _cachedTexturePtr = srcTexture;
+                ResoniteMod.Msg($"[NvEnc:{_streamId}] Registered new texture resource ptr=0x{srcTexture:X}");
+            }
 
             // Detect pause: if >200ms since last frame, force IDR + SPS/PPS so decoder can resync
             long now = DateTime.UtcNow.Ticks;
@@ -298,7 +354,7 @@ public sealed class NvEncHlsEncoder : IDisposable
             {
                 Version = NV_ENC_PIC_PARAMS_VER,
                 PictureStruct = NvEncPicStruct.Frame,
-                InputBuffer = reg.AsInputPointer(),
+                InputBuffer = _cachedReg.AsInputPointer(),
                 BufferFmt = NvEncBufferFormat.Argb,
                 InputWidth = width,
                 InputHeight = height,
@@ -338,10 +394,13 @@ public sealed class NvEncHlsEncoder : IDisposable
     public void Dispose()
     {
         _initialized = false;
+        try { _cachedRegistration?.Dispose(); _cachedRegistration = null; _cachedTexturePtr = IntPtr.Zero; } catch { }
         try { _ffmpegStdin?.Close(); } catch { }
         try { if (_ffmpeg != null && !_ffmpeg.HasExited) _ffmpeg.Kill(); } catch { }
         try { _encoder.DestroyBitstreamBuffer(_bitstreamBuffer.BitstreamBuffer); } catch { }
         try { _encoder.DestroyEncoder(); } catch { }
+        try { if (_dataAvailable.CurrentCount == 0) _dataAvailable.Release(); } catch { } // Wake any waiting HTTP clients so they can exit
+        try { _dataAvailable.Dispose(); } catch { }
         try { Directory.Delete(_hlsDir, true); } catch { }
         ResoniteMod.Msg($"[NvEnc:{_streamId}] Disposed, {_totalFrames} total frames");
     }

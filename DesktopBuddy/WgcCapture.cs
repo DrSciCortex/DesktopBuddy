@@ -47,6 +47,15 @@ public sealed class WgcCapture : IDisposable
         IntPtr pFeatureLevels, uint FeatureLevels, uint SDKVersion,
         out IntPtr ppDevice, out int pFeatureLevel, out IntPtr ppImmediateContext);
 
+    [DllImport("d3dcompiler_47.dll", EntryPoint = "D3DCompile")]
+    private static extern int D3DCompile(
+        [MarshalAs(UnmanagedType.LPStr)] string pSrcData, int srcDataSize,
+        IntPtr pSourceName, IntPtr pDefines, IntPtr pInclude,
+        [MarshalAs(UnmanagedType.LPStr)] string pEntrypoint,
+        [MarshalAs(UnmanagedType.LPStr)] string pTarget,
+        uint flags1, uint flags2,
+        out IntPtr ppCode, out IntPtr ppErrorMsgs);
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr LoadLibraryW(string lpFileName);
 
@@ -69,12 +78,22 @@ public sealed class WgcCapture : IDisposable
     private const int D3D_DRIVER_TYPE_HARDWARE = 1;
     private const uint D3D11_CREATE_DEVICE_BGRA_SUPPORT = 0x20;
 
-    // ID3D11Device vtable indices
+    // ID3D11Device vtable indices (verified against d3d11.h 10.0.19041.0)
+    private const int ID3D11Device_CreateBuffer = 3;
     private const int ID3D11Device_CreateTexture2D = 5;
-    // ID3D11DeviceContext vtable indices
+    private const int ID3D11Device_CreateShaderResourceView = 7;
+    private const int ID3D11Device_CreateUnorderedAccessView = 8;
+    private const int ID3D11Device_CreateComputeShader = 18;
+    private const int ID3D11Device_GetDeviceRemovedReason = 38;
+    // ID3D11DeviceContext vtable indices (verified against d3d11.h 10.0.19041.0)
     private const int ID3D11DeviceContext_Map = 14;
     private const int ID3D11DeviceContext_Unmap = 15;
+    private const int ID3D11DeviceContext_Dispatch = 41;
     private const int ID3D11DeviceContext_CopyResource = 47;
+    private const int ID3D11DeviceContext_CSSetShaderResources = 67;
+    private const int ID3D11DeviceContext_CSSetUnorderedAccessViews = 68;
+    private const int ID3D11DeviceContext_CSSetShader = 69;
+    private const int ID3D11DeviceContext_CSSetConstantBuffers = 71;
 
     // D3D11 structures
     [StructLayout(LayoutKind.Sequential)]
@@ -104,8 +123,57 @@ public sealed class WgcCapture : IDisposable
     }
 
     private const int DXGI_FORMAT_B8G8R8A8_UNORM = 87;
+    private const int DXGI_FORMAT_R8G8B8A8_UNORM = 28;
+    private const int DXGI_FORMAT_R32_UINT = 42;
+    private const int D3D11_USAGE_DEFAULT = 0;
     private const int D3D11_USAGE_STAGING = 3;
+    private const int D3D11_USAGE_DYNAMIC = 2;
     private const uint D3D11_CPU_ACCESS_READ = 0x20000;
+    private const uint D3D11_CPU_ACCESS_WRITE = 0x10000;
+    private const uint D3D11_BIND_SHADER_RESOURCE = 0x8;
+    private const uint D3D11_BIND_UNORDERED_ACCESS = 0x80;
+    private const uint D3D11_BIND_CONSTANT_BUFFER = 0x4;
+
+    // Structures for compute shader views
+    [StructLayout(LayoutKind.Sequential)]
+    private struct D3D11_SHADER_RESOURCE_VIEW_DESC
+    {
+        public int Format;
+        public int ViewDimension; // D3D11_SRV_DIMENSION_TEXTURE2D = 4
+        public uint MostDetailedMip;
+        public uint MipLevels;
+        // remaining union fields (unused for Texture2D with single mip)
+        public uint Pad0, Pad1;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct D3D11_UNORDERED_ACCESS_VIEW_DESC
+    {
+        public int Format;
+        public int ViewDimension; // D3D11_UAV_DIMENSION_TEXTURE2D = 2
+        public uint MipSlice;
+        // remaining union fields
+        public uint Pad0, Pad1;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct D3D11_BUFFER_DESC
+    {
+        public uint ByteWidth;
+        public int Usage;
+        public uint BindFlags;
+        public uint CPUAccessFlags;
+        public uint MiscFlags;
+        public uint StructureByteStride;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GpuConstants
+    {
+        public uint Width;
+        public uint Height;
+        public uint Pad0, Pad1; // 16-byte alignment for constant buffer
+    }
 
     /// <summary>
     /// Called with (d3dDevice, srcTexture, width, height) for each captured frame.
@@ -135,6 +203,16 @@ public sealed class WgcCapture : IDisposable
     private int _framesCaptured;
     private bool _disposed;
 
+    // GPU compute shader pipeline for BGRA→RGBA + Y-flip
+    private IntPtr _computeShader;
+    private IntPtr _convertedTexture; // R8G8B8A8_UNORM output from compute shader
+    private IntPtr _convertedSRV;     // Not used for output, but we need SRV on source
+    private IntPtr _sourceSRV;        // SRV for source BGRA texture
+    private IntPtr _destUAV;          // UAV for destination RGBA texture
+    private IntPtr _constantBuffer;   // Width/Height constants
+    private int _gpuConvertW, _gpuConvertH;
+    private bool _gpuConvertReady;
+
     public int Width { get; private set; }
     public int Height { get; private set; }
     public int FramesCaptured => _framesCaptured;
@@ -149,17 +227,25 @@ public sealed class WgcCapture : IDisposable
         _isDesktop = hwnd == IntPtr.Zero;
         try
         {
-            ResoniteModLoader.ResoniteMod.Msg("[WgcCapture] Step 1: D3D11CreateDevice");
+            // Try with debug layer first for better error diagnostics, fall back to no debug
+            uint deviceFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | 0x2; // 0x2 = D3D11_CREATE_DEVICE_DEBUG
             int hr = D3D11CreateDevice(IntPtr.Zero, D3D_DRIVER_TYPE_HARDWARE, IntPtr.Zero,
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT, IntPtr.Zero, 0, 7,
+                deviceFlags, IntPtr.Zero, 0, 7,
                 out _d3dDevice, out _, out _d3dContext);
+            if (hr < 0)
+            {
+                ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] Debug device failed (hr=0x{hr:X8}), trying without debug");
+                deviceFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+                hr = D3D11CreateDevice(IntPtr.Zero, D3D_DRIVER_TYPE_HARDWARE, IntPtr.Zero,
+                    deviceFlags, IntPtr.Zero, 0, 7,
+                    out _d3dDevice, out _, out _d3dContext);
+            }
             if (hr < 0) { ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] D3D11CreateDevice failed hr=0x{hr:X8}"); return false; }
+            ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] D3D11 device created (debug={(deviceFlags & 0x2) != 0})");
 
-            ResoniteModLoader.ResoniteMod.Msg("[WgcCapture] Step 2: QueryInterface IDXGIDevice");
             var dxgiGuid = new Guid("54ec77fa-1377-44e6-8c32-88fd5f44c84c");
             Marshal.QueryInterface(_d3dDevice, ref dxgiGuid, out IntPtr dxgiDevice);
 
-            ResoniteModLoader.ResoniteMod.Msg("[WgcCapture] Step 3: CreateDirect3D11DeviceFromDXGIDevice");
             hr = CallCreateDirect3D11DeviceFromDXGIDevice(dxgiDevice, out IntPtr inspectable);
             Marshal.Release(dxgiDevice);
             if (hr < 0 || inspectable == IntPtr.Zero)
@@ -168,15 +254,12 @@ public sealed class WgcCapture : IDisposable
                 return false;
             }
 
-            ResoniteModLoader.ResoniteMod.Msg("[WgcCapture] Step 4: GetObjectForIUnknown → IDirect3DDevice");
             _winrtDevice = MarshalInterface<IDirect3DDevice>.FromAbi(inspectable);
             Marshal.Release(inspectable);
 
-            ResoniteModLoader.ResoniteMod.Msg("[WgcCapture] Step 5: CreateCaptureItem");
             if (hwnd == IntPtr.Zero)
             {
                 var monitorHandle = MonitorFromPoint(0, 0, 1);
-                ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] Monitor handle: {monitorHandle}");
                 _item = CreateItemForMonitor(monitorHandle);
             }
             else
@@ -186,36 +269,26 @@ public sealed class WgcCapture : IDisposable
 
             if (_item == null) { ResoniteModLoader.ResoniteMod.Msg("[WgcCapture] CaptureItem is null"); return false; }
 
-            _item.Closed += (sender, args) =>
-            {
-                ResoniteModLoader.ResoniteMod.Msg("[WgcCapture] Closed event fired!");
-                _closed = true;
-            };
-            ResoniteModLoader.ResoniteMod.Msg("[WgcCapture] Subscribed to Closed event");
+            _item.Closed += (sender, args) => { _closed = true; };
 
             Width = _item.Size.Width;
             Height = _item.Size.Height;
-            ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] Step 6: Item created {Width}x{Height}");
 
-            ResoniteModLoader.ResoniteMod.Msg("[WgcCapture] Step 7: CreateFreeThreaded frame pool");
             _framePool = Direct3D11CaptureFramePool.CreateFreeThreaded(
                 _winrtDevice,
                 DirectXPixelFormat.B8G8R8A8UIntNormalized,
                 2,
                 _item.Size);
 
-            ResoniteModLoader.ResoniteMod.Msg("[WgcCapture] Step 8: FrameArrived += OnFrameArrived");
             _framePool.FrameArrived += OnFrameArrived;
 
-            ResoniteModLoader.ResoniteMod.Msg("[WgcCapture] Step 9: CreateCaptureSession");
             _session = _framePool.CreateCaptureSession(_item);
             _session.IsBorderRequired = false;
             _session.IsCursorCaptureEnabled = true;
 
-            ResoniteModLoader.ResoniteMod.Msg("[WgcCapture] Step 10: StartCapture");
             _session.StartCapture();
 
-            ResoniteModLoader.ResoniteMod.Msg("[WgcCapture] Init complete, capture running");
+            ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] Init complete: {Width}x{Height}, hwnd={hwnd}");
             return true;
         }
         catch (Exception ex)
@@ -280,14 +353,13 @@ public sealed class WgcCapture : IDisposable
         try
         {
         using var frame = sender.TryGetNextFrame();
-        if (frame == null) { if (_frameLog < 3) ResoniteModLoader.ResoniteMod.Msg("[WgcCapture] OnFrameArrived: frame is null"); return; }
+        if (frame == null) return;
 
         var size = frame.ContentSize;
         int w = size.Width;
         int h = size.Height;
         _frameLog++;
-        if (_frameLog <= 5) ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] OnFrameArrived #{_frameLog}: {w}x{h}");
-        if (w <= 0 || h <= 0) { if (_frameLog <= 5) ResoniteModLoader.ResoniteMod.Msg("[WgcCapture] bad size, skip"); return; }
+        if (w <= 0 || h <= 0) return;
 
         if (w != Width || h != Height)
         {
@@ -298,17 +370,13 @@ public sealed class WgcCapture : IDisposable
             return; // Skip this frame
         }
 
-        if (_frameLog <= 5) ResoniteModLoader.ResoniteMod.Msg("[WgcCapture] Getting surface texture");
-        // Get the raw IUnknown* for the surface via WinRT marshaling
         IntPtr surfaceAbi = MarshalInterface<IDirect3DSurface>.FromManaged(frame.Surface);
-        if (surfaceAbi == IntPtr.Zero) { if (_frameLog <= 5) ResoniteModLoader.ResoniteMod.Msg("[WgcCapture] surfaceAbi is null"); return; }
+        if (surfaceAbi == IntPtr.Zero) return;
 
-        // QI for IDirect3DDxgiInterfaceAccess
         var dxgiAccessGuid = new Guid("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1");
         int qiHr = Marshal.QueryInterface(surfaceAbi, ref dxgiAccessGuid, out IntPtr dxgiAccessPtr);
-        if (qiHr < 0 || dxgiAccessPtr == IntPtr.Zero) { if (_frameLog <= 5) ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] QI for DxgiAccess failed hr=0x{qiHr:X8}"); return; }
+        if (qiHr < 0 || dxgiAccessPtr == IntPtr.Zero) return;
 
-        // Call GetInterface to get ID3D11Texture2D
         var texGuid = new Guid("6f15aaf2-d208-4e89-9ab4-489535d34f9c");
         IntPtr srcTexture;
         unsafe
@@ -319,10 +387,9 @@ public sealed class WgcCapture : IDisposable
             IntPtr tex;
             int getHr = fn(dxgiAccessPtr, &localTexGuid, &tex);
             srcTexture = tex;
-            if (getHr < 0) { Marshal.Release(dxgiAccessPtr); if (_frameLog <= 5) ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] GetInterface failed hr=0x{getHr:X8}"); return; }
+            if (getHr < 0) { Marshal.Release(dxgiAccessPtr); return; }
         }
         Marshal.Release(dxgiAccessPtr);
-        if (_frameLog <= 5) ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] srcTexture={srcTexture}");
 
         try
         {
@@ -332,18 +399,25 @@ public sealed class WgcCapture : IDisposable
             ContextCopyResource(_d3dContext, _encodeTexture, srcTexture);
 
             // GPU encode callback — NVENC encodes from the persistent copy
-            try { OnGpuFrame?.Invoke(_d3dDevice, _encodeTexture, w, h); }
-            catch (Exception gpuEx) { ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] OnGpuFrame error: {gpuEx}"); }
+            using (DesktopBuddyMod.Perf.Time("nvenc_encode"))
+            {
+                try { OnGpuFrame?.Invoke(_d3dDevice, _encodeTexture, w, h); }
+                catch (Exception gpuEx) { ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] OnGpuFrame error: {gpuEx}"); }
+            }
 
-            // Copy to staging for CPU readback (local preview)
+            // GPU BGRA→RGBA + Y-flip via compute shader, then copy to staging for CPU readback
+            EnsureGpuConvertPipeline(w, h);
             EnsureStagingTexture(w, h);
-            if (_frameLog <= 5) ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] CopyResource staging={_stagingTexture}");
-            ContextCopyResource(_d3dContext, _stagingTexture, srcTexture);
+
+            using (DesktopBuddyMod.Perf.Time("gpu_convert"))
+                GpuConvertBgraToRgba(srcTexture, w, h);
+            ContextCopyResource(_d3dContext, _stagingTexture, _convertedTexture);
 
             var mapped = new D3D11_MAPPED_SUBRESOURCE();
-            int hr = ContextMap(_d3dContext, _stagingTexture, 0, 1, 0, ref mapped);
-            if (_frameLog <= 5) ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] Map hr=0x{hr:X8} pData={mapped.pData} pitch={mapped.RowPitch}");
-            if (hr < 0) return;
+            int hr;
+            using (DesktopBuddyMod.Perf.Time("gpu_readback"))
+                hr = ContextMap(_d3dContext, _stagingTexture, 0, 1, 0, ref mapped);
+            if (hr < 0) { ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] Map failed hr=0x{hr:X8}"); return; }
 
             try
             {
@@ -351,45 +425,46 @@ public sealed class WgcCapture : IDisposable
                 EnsureBuffer(bufSize);
                 int srcPitch = (int)mapped.RowPitch;
                 int dstStride = w * 4;
-                unsafe
+
+                // GPU already did BGRA→RGBA + Y-flip, just memcpy rows (handle pitch)
+                using (DesktopBuddyMod.Perf.Time("cpu_memcpy"))
                 {
-                    byte* src = (byte*)mapped.pData;
-                    fixed (byte* dst = _buffer)
+                    unsafe
                     {
-                        // Y-flip + BGRA→RGBA in one pass
-                        for (int y = 0; y < h; y++)
+                        byte* src = (byte*)mapped.pData;
+                        fixed (byte* dst = _buffer)
                         {
-                            uint* srcRow = (uint*)(src + y * srcPitch);
-                            uint* dstRow = (uint*)(dst + (h - 1 - y) * dstStride);
-                            for (int x = 0; x < w; x++)
+                            if (srcPitch == dstStride)
                             {
-                                uint px = srcRow[x];
-                                uint b = px & 0xFFu;
-                                uint g = (px >> 8) & 0xFFu;
-                                uint r = (px >> 16) & 0xFFu;
-                                dstRow[x] = r | (g << 8) | (b << 16) | 0xFF000000u;
+                                Buffer.MemoryCopy(src, dst, bufSize, bufSize);
+                            }
+                            else
+                            {
+                                for (int y = 0; y < h; y++)
+                                    Buffer.MemoryCopy(src + y * srcPitch, dst + y * dstStride, dstStride, dstStride);
                             }
                         }
                     }
                 }
+
                 lock (_frameLock)
                 {
                     _lastWidth = w; _lastHeight = h;
                     _frameReady = true; _framesCaptured++;
                 }
-                if (_frameLog <= 5) ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] Frame #{_framesCaptured} ready, {w}x{h}, bufSize={bufSize}");
+                if (_framesCaptured == 1) ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] First frame ready: {w}x{h}, GPU compute shader active");
             }
             finally { ContextUnmap(_d3dContext, _stagingTexture, 0); }
         }
         catch (Exception ex)
         {
-            if (_frameLog <= 5) ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] OnFrameArrived exception: {ex.Message}");
+            ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] OnFrameArrived error: {ex.Message}");
         }
         finally { Marshal.Release(srcTexture); }
         }
         catch (Exception ex)
         {
-            if (_frameLog <= 10) ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] OnFrameArrived OUTER exception: {ex.Message}\n{ex.StackTrace}");
+            ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] OnFrameArrived OUTER error: {ex.Message}\n{ex.StackTrace}");
         }
     }
 
@@ -441,11 +516,11 @@ public sealed class WgcCapture : IDisposable
             {
                 while (!_disposed)
                 {
-                    Thread.Sleep(100); // 10fps keepalive
+                    Thread.Sleep(50); // 20fps keepalive check
                     if (_disposed || OnGpuFrame == null || _encodeTexture == IntPtr.Zero) continue;
                     // Only send keepalive if WGC hasn't fired recently
                     long msSinceFrame = (DateTime.UtcNow.Ticks - Interlocked.Read(ref _lastFrameTicks)) / TimeSpan.TicksPerMillisecond;
-                    if (msSinceFrame > 150) // 150ms idle = send keepalive
+                    if (msSinceFrame > 100) // 100ms idle = send keepalive
                     {
                         try { OnGpuFrame.Invoke(_d3dDevice, _encodeTexture, _encodeTexW, _encodeTexH); }
                         catch (Exception kaEx) { ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] Keepalive error: {kaEx.Message}"); }
@@ -462,8 +537,6 @@ public sealed class WgcCapture : IDisposable
     {
         if (_stagingTexture != IntPtr.Zero)
         {
-            // Check if size matches - if not, release and recreate
-            // For simplicity, track size
             if (w == _lastWidth && h == _lastHeight) return;
             Marshal.Release(_stagingTexture);
             _stagingTexture = IntPtr.Zero;
@@ -475,7 +548,7 @@ public sealed class WgcCapture : IDisposable
             Height = (uint)h,
             MipLevels = 1,
             ArraySize = 1,
-            Format = DXGI_FORMAT_B8G8R8A8_UNORM,
+            Format = DXGI_FORMAT_R32_UINT, // Matches GPU compute shader output
             SampleCount = 1,
             SampleQuality = 0,
             Usage = D3D11_USAGE_STAGING,
@@ -493,6 +566,169 @@ public sealed class WgcCapture : IDisposable
         if (_pinnedBuffer.IsAllocated) _pinnedBuffer.Free();
         _buffer = new byte[size];
         _pinnedBuffer = GCHandle.Alloc(_buffer, GCHandleType.Pinned);
+    }
+
+    private unsafe void CheckDevice(string context)
+    {
+        var vtable = *(IntPtr**)_d3dDevice;
+        var fn = (delegate* unmanaged[Stdcall]<IntPtr, int>)vtable[ID3D11Device_GetDeviceRemovedReason];
+        int hr = fn(_d3dDevice);
+        if (hr < 0)
+            ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] DEVICE REMOVED after {context}: hr=0x{hr:X8}");
+    }
+
+    // GPU compute shader setup for BGRA→RGBA + Y-flip
+    private void EnsureGpuConvertPipeline(int w, int h)
+    {
+        if (_gpuConvertReady && w == _gpuConvertW && h == _gpuConvertH) return;
+
+        // Release old resources if size changed
+        ReleaseGpuConvertResources();
+
+        try
+        {
+            // Load compiled shader from embedded resource
+            if (_computeShader == IntPtr.Zero)
+            {
+                var asm = typeof(WgcCapture).Assembly;
+                using var stream = asm.GetManifestResourceStream("DesktopBuddy.Shaders.BgraToRgba.cso");
+                if (stream == null) { ResoniteModLoader.ResoniteMod.Msg("[WgcCapture] GPU shader not found in resources, falling back to CPU"); return; }
+                var bytecode = new byte[stream.Length];
+                stream.Read(bytecode, 0, bytecode.Length);
+
+                _computeShader = DeviceCreateComputeShader(_d3dDevice, bytecode);
+                ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] GPU compute shader created ({bytecode.Length} bytes)");
+            }
+
+            // Create RGBA output texture (DEFAULT usage, UAV bindable)
+            var texDesc = new D3D11_TEXTURE2D_DESC
+            {
+                Width = (uint)w, Height = (uint)h,
+                MipLevels = 1, ArraySize = 1,
+                Format = DXGI_FORMAT_R32_UINT, // R32_UINT for uint read/write in shader
+                SampleCount = 1, SampleQuality = 0,
+                Usage = D3D11_USAGE_DEFAULT,
+                BindFlags = D3D11_BIND_UNORDERED_ACCESS,
+                CPUAccessFlags = 0, MiscFlags = 0
+            };
+            DeviceCreateTexture2D(_d3dDevice, ref texDesc, IntPtr.Zero, out _convertedTexture);
+            ResoniteModLoader.ResoniteMod.Msg($"[GPU] UAV texture created: 0x{_convertedTexture:X}");
+
+            // Create UAV on destination
+            var uavDesc = new D3D11_UNORDERED_ACCESS_VIEW_DESC
+            {
+                Format = DXGI_FORMAT_R32_UINT,
+                ViewDimension = 4, // D3D11_UAV_DIMENSION_TEXTURE2D
+                MipSlice = 0
+            };
+            _destUAV = DeviceCreateUAV(_d3dDevice, _convertedTexture, ref uavDesc);
+            ResoniteModLoader.ResoniteMod.Msg($"[GPU] UAV created: 0x{_destUAV:X}");
+
+            _constantBuffer = DeviceCreateConstantBuffer(_d3dDevice, 16);
+            ResoniteModLoader.ResoniteMod.Msg($"[GPU] Constant buffer created: 0x{_constantBuffer:X}");
+
+            // Create a SRV-bindable copy of source texture — same BGRA format so CopyResource works
+            var srvTexDesc = new D3D11_TEXTURE2D_DESC
+            {
+                Width = (uint)w, Height = (uint)h,
+                MipLevels = 1, ArraySize = 1,
+                Format = DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleCount = 1, SampleQuality = 0,
+                Usage = D3D11_USAGE_DEFAULT,
+                BindFlags = D3D11_BIND_SHADER_RESOURCE,
+                CPUAccessFlags = 0, MiscFlags = 0
+            };
+            DeviceCreateTexture2D(_d3dDevice, ref srvTexDesc, IntPtr.Zero, out var srvTexture);
+
+            var srvDesc = new D3D11_SHADER_RESOURCE_VIEW_DESC
+            {
+                Format = DXGI_FORMAT_B8G8R8A8_UNORM,
+                ViewDimension = 4, // D3D11_SRV_DIMENSION_TEXTURE2D
+                MostDetailedMip = 0,
+                MipLevels = 1
+            };
+            _sourceSRV = DeviceCreateSRV(_d3dDevice, srvTexture, ref srvDesc);
+            _convertedSRV = srvTexture;
+            ResoniteModLoader.ResoniteMod.Msg($"[GPU] SRV texture created: 0x{srvTexture:X}, SRV: 0x{_sourceSRV:X}");
+
+            _gpuConvertW = w;
+            _gpuConvertH = h;
+            _gpuConvertReady = true;
+            ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] GPU convert pipeline ready: {w}x{h}");
+        }
+        catch (Exception ex)
+        {
+            ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] GPU convert pipeline failed: {ex.Message}, falling back to CPU");
+            ReleaseGpuConvertResources();
+        }
+    }
+
+    private int _gpuDispatchCount;
+
+    private unsafe void GpuConvertBgraToRgba(IntPtr srcTexture, int w, int h)
+    {
+        bool verbose = _gpuDispatchCount < 3; // Log first 3 dispatches in detail
+        _gpuDispatchCount++;
+
+        if (verbose) ResoniteModLoader.ResoniteMod.Msg($"[GPU] Dispatch #{_gpuDispatchCount}: {w}x{h} src=0x{srcTexture:X} srvTex=0x{_convertedSRV:X} shader=0x{_computeShader:X}");
+
+        // Copy source BGRA texture to our SRV-bindable texture (same format, reinterpreted as R32_UINT)
+        ContextCopyResource(_d3dContext, _convertedSRV, srcTexture);
+        if (verbose) { CheckDevice("CopyResource->SRV"); ResoniteModLoader.ResoniteMod.Msg("[GPU] CopyResource to SRV texture OK"); }
+
+        // Update constant buffer with dimensions
+        var mapped = new D3D11_MAPPED_SUBRESOURCE();
+        int hr = ContextMap(_d3dContext, _constantBuffer, 0, 4, 0, ref mapped); // D3D11_MAP_WRITE_DISCARD = 4
+        if (hr < 0) { ResoniteModLoader.ResoniteMod.Msg($"[GPU] ConstantBuffer Map failed hr=0x{hr:X8}"); return; }
+        var constants = (GpuConstants*)mapped.pData;
+        constants->Width = (uint)w;
+        constants->Height = (uint)h;
+        ContextUnmap(_d3dContext, _constantBuffer, 0);
+        if (verbose) ResoniteModLoader.ResoniteMod.Msg("[GPU] Constants updated");
+
+        // Dispatch compute shader
+        var vtable = *(IntPtr**)_d3dContext;
+
+        var csSetShader = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, IntPtr, uint, void>)vtable[ID3D11DeviceContext_CSSetShader];
+        csSetShader(_d3dContext, _computeShader, IntPtr.Zero, 0);
+        if (verbose) ResoniteModLoader.ResoniteMod.Msg("[GPU] CSSetShader OK");
+
+        IntPtr srv = _sourceSRV;
+        var csSetSRV = (delegate* unmanaged[Stdcall]<IntPtr, uint, uint, IntPtr*, void>)vtable[ID3D11DeviceContext_CSSetShaderResources];
+        csSetSRV(_d3dContext, 0, 1, &srv);
+        if (verbose) ResoniteModLoader.ResoniteMod.Msg("[GPU] CSSetShaderResources OK");
+
+        IntPtr uav = _destUAV;
+        var csSetUAV = (delegate* unmanaged[Stdcall]<IntPtr, uint, uint, IntPtr*, IntPtr, void>)vtable[ID3D11DeviceContext_CSSetUnorderedAccessViews];
+        csSetUAV(_d3dContext, 0, 1, &uav, IntPtr.Zero);
+        if (verbose) ResoniteModLoader.ResoniteMod.Msg("[GPU] CSSetUnorderedAccessViews OK");
+
+        IntPtr cb = _constantBuffer;
+        var csSetCB = (delegate* unmanaged[Stdcall]<IntPtr, uint, uint, IntPtr*, void>)vtable[ID3D11DeviceContext_CSSetConstantBuffers];
+        csSetCB(_d3dContext, 0, 1, &cb);
+        if (verbose) ResoniteModLoader.ResoniteMod.Msg("[GPU] CSSetConstantBuffers OK");
+
+        uint groupsX = ((uint)w + 15) / 16, groupsY = ((uint)h + 15) / 16;
+        if (verbose) ResoniteModLoader.ResoniteMod.Msg($"[GPU] Dispatching {groupsX}x{groupsY}x1...");
+        var dispatch = (delegate* unmanaged[Stdcall]<IntPtr, uint, uint, uint, void>)vtable[ID3D11DeviceContext_Dispatch];
+        dispatch(_d3dContext, groupsX, groupsY, 1);
+        if (verbose) { CheckDevice("Dispatch"); ResoniteModLoader.ResoniteMod.Msg("[GPU] Dispatch OK"); }
+
+        // Unbind resources
+        IntPtr nullPtr = IntPtr.Zero;
+        csSetSRV(_d3dContext, 0, 1, &nullPtr);
+        csSetUAV(_d3dContext, 0, 1, &nullPtr, IntPtr.Zero);
+        if (verbose) ResoniteModLoader.ResoniteMod.Msg("[GPU] Unbind OK, dispatch complete");
+    }
+
+    private void ReleaseGpuConvertResources()
+    {
+        _gpuConvertReady = false;
+        if (_destUAV != IntPtr.Zero) { Marshal.Release(_destUAV); _destUAV = IntPtr.Zero; }
+        if (_sourceSRV != IntPtr.Zero) { Marshal.Release(_sourceSRV); _sourceSRV = IntPtr.Zero; }
+        if (_convertedSRV != IntPtr.Zero) { Marshal.Release(_convertedSRV); _convertedSRV = IntPtr.Zero; }
+        if (_convertedTexture != IntPtr.Zero) { Marshal.Release(_convertedTexture); _convertedTexture = IntPtr.Zero; }
+        if (_constantBuffer != IntPtr.Zero) { Marshal.Release(_constantBuffer); _constantBuffer = IntPtr.Zero; }
     }
 
     // D3D11 vtable calls via raw COM
@@ -525,6 +761,53 @@ public sealed class WgcCapture : IDisposable
         if (hr < 0) throw new COMException("CreateTexture2D failed", hr);
     }
 
+    private static unsafe IntPtr DeviceCreateComputeShader(IntPtr device, byte[] bytecode)
+    {
+        var vtable = *(IntPtr**)device;
+        var fn = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, nuint, IntPtr, out IntPtr, int>)vtable[ID3D11Device_CreateComputeShader];
+        fixed (byte* pBytecode = bytecode)
+        {
+            int hr = fn(device, (IntPtr)pBytecode, (nuint)bytecode.Length, IntPtr.Zero, out IntPtr shader);
+            if (hr < 0) throw new COMException($"CreateComputeShader failed hr=0x{hr:X8}", hr);
+            return shader;
+        }
+    }
+
+    private static unsafe IntPtr DeviceCreateSRV(IntPtr device, IntPtr resource, ref D3D11_SHADER_RESOURCE_VIEW_DESC desc)
+    {
+        var vtable = *(IntPtr**)device;
+        var fn = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, ref D3D11_SHADER_RESOURCE_VIEW_DESC, out IntPtr, int>)vtable[ID3D11Device_CreateShaderResourceView];
+        int hr = fn(device, resource, ref desc, out IntPtr srv);
+        if (hr < 0) throw new COMException($"CreateShaderResourceView failed hr=0x{hr:X8}", hr);
+        return srv;
+    }
+
+    private static unsafe IntPtr DeviceCreateUAV(IntPtr device, IntPtr resource, ref D3D11_UNORDERED_ACCESS_VIEW_DESC desc)
+    {
+        var vtable = *(IntPtr**)device;
+        var fn = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, ref D3D11_UNORDERED_ACCESS_VIEW_DESC, out IntPtr, int>)vtable[ID3D11Device_CreateUnorderedAccessView];
+        int hr = fn(device, resource, ref desc, out IntPtr uav);
+        if (hr < 0) throw new COMException($"CreateUnorderedAccessView failed hr=0x{hr:X8}", hr);
+        return uav;
+    }
+
+    private static unsafe IntPtr DeviceCreateConstantBuffer(IntPtr device, uint size)
+    {
+        var vtable = *(IntPtr**)device;
+        var desc = new D3D11_BUFFER_DESC
+        {
+            ByteWidth = size,
+            Usage = D3D11_USAGE_DYNAMIC,
+            BindFlags = D3D11_BIND_CONSTANT_BUFFER,
+            CPUAccessFlags = D3D11_CPU_ACCESS_WRITE,
+            MiscFlags = 0, StructureByteStride = 0
+        };
+        var fn = (delegate* unmanaged[Stdcall]<IntPtr, ref D3D11_BUFFER_DESC, IntPtr, out IntPtr, int>)vtable[ID3D11Device_CreateBuffer];
+        int hr = fn(device, ref desc, IntPtr.Zero, out IntPtr buffer);
+        if (hr < 0) throw new COMException($"CreateBuffer failed hr=0x{hr:X8}", hr);
+        return buffer;
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
@@ -534,6 +817,8 @@ public sealed class WgcCapture : IDisposable
         try { _framePool?.Dispose(); } catch { }
         _item = null;
 
+        ReleaseGpuConvertResources();
+        if (_computeShader != IntPtr.Zero) { Marshal.Release(_computeShader); _computeShader = IntPtr.Zero; }
         if (_encodeTexture != IntPtr.Zero) { Marshal.Release(_encodeTexture); _encodeTexture = IntPtr.Zero; }
         if (_stagingTexture != IntPtr.Zero) { Marshal.Release(_stagingTexture); _stagingTexture = IntPtr.Zero; }
         if (_d3dContext != IntPtr.Zero) { Marshal.Release(_d3dContext); _d3dContext = IntPtr.Zero; }

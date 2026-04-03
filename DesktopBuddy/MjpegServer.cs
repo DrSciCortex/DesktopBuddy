@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
 using System.Threading;
+using System.Threading.Tasks;
 using ResoniteModLoader;
 
 namespace DesktopBuddy;
@@ -10,13 +11,13 @@ namespace DesktopBuddy;
 /// <summary>
 /// HTTP server serving MPEG-TS streams from NvEncHlsEncoder (NVENC GPU + FFmpeg muxing).
 /// NVENC encodes on GPU → tiny H.264 piped to FFmpeg → MPEG-TS stdout → HTTP to clients.
+/// Fully async — no thread-per-client, scales to many concurrent viewers.
 ///
 /// GET /stream/{streamId} → continuous MPEG-TS stream
 /// </summary>
 public sealed class MjpegServer : IDisposable
 {
     private HttpListener _listener;
-    private readonly Thread _listenThread;
     private volatile bool _running;
     private readonly int _port;
 
@@ -29,7 +30,6 @@ public sealed class MjpegServer : IDisposable
         _port = port;
         _listener = new HttpListener();
         _running = true;
-        _listenThread = new Thread(ListenLoop) { IsBackground = true, Name = "DesktopBuddy_HTTP" };
     }
 
     public void Start()
@@ -71,7 +71,8 @@ public sealed class MjpegServer : IDisposable
             _listener.Start();
             ResoniteMod.Msg($"[MjpegServer] Listening on http://+:{_port}/ (after urlacl)");
         }
-        _listenThread.Start();
+        // Fire-and-forget async listen loop (runs on thread pool)
+        _ = ListenLoopAsync();
     }
 
     public NvEncHlsEncoder CreateEncoder(int streamId)
@@ -88,27 +89,33 @@ public sealed class MjpegServer : IDisposable
             enc.Dispose();
     }
 
-    private void ListenLoop()
+    private async Task ListenLoopAsync()
     {
+        ResoniteMod.Msg("[MjpegServer] Async listen loop started");
         while (_running)
         {
             try
             {
-                var ctx = _listener.GetContext();
-                ThreadPool.QueueUserWorkItem(_ => HandleRequest(ctx));
+                var ctx = await _listener.GetContextAsync().ConfigureAwait(false);
+                _ = HandleRequestAsync(ctx); // Fire-and-forget per request
             }
             catch (HttpListenerException) { break; }
-            catch { }
+            catch (ObjectDisposedException) { break; }
+            catch (Exception ex)
+            {
+                ResoniteMod.Msg($"[MjpegServer] Listen error: {ex.Message}");
+            }
         }
+        ResoniteMod.Msg("[MjpegServer] Async listen loop ended");
     }
 
-    private void HandleRequest(HttpListenerContext ctx)
+    private async Task HandleRequestAsync(HttpListenerContext ctx)
     {
         try
         {
             var path = ctx.Request.Url?.AbsolutePath ?? "/";
             if (path.StartsWith("/stream/"))
-                ServeStream(ctx, path);
+                await ServeStreamAsync(ctx, path).ConfigureAwait(false);
             else
             {
                 ctx.Response.StatusCode = 404;
@@ -118,7 +125,7 @@ public sealed class MjpegServer : IDisposable
         catch { try { ctx.Response.Close(); } catch { } }
     }
 
-    private void ServeStream(HttpListenerContext ctx, string urlPath)
+    private async Task ServeStreamAsync(HttpListenerContext ctx, string urlPath)
     {
         var parts = urlPath.Split('/', StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length < 2) { ctx.Response.StatusCode = 404; ctx.Response.Close(); return; }
@@ -131,11 +138,11 @@ public sealed class MjpegServer : IDisposable
             return;
         }
 
-        // Wait for encoder to be ready
+        // Wait for encoder to be ready (async, no thread blocked)
         int waitCount = 0;
         while (!encoder.IsRunning && waitCount < 50)
         {
-            Thread.Sleep(100);
+            await Task.Delay(100).ConfigureAwait(false);
             waitCount++;
         }
         if (!encoder.IsRunning)
@@ -153,21 +160,21 @@ public sealed class MjpegServer : IDisposable
 
         long totalBytes = 0;
         long readPos = 0; // Start from latest data
+        bool aligned = false; // MPEG-TS sync state — only scan once per client
         try
         {
             var buffer = new byte[65536];
             while (_running && encoder.IsRunning)
             {
-                int read = encoder.ReadStream(buffer, ref readPos);
+                int read = encoder.ReadStream(buffer, ref readPos, ref aligned);
                 if (read > 0)
                 {
-                    ctx.Response.OutputStream.Write(buffer, 0, read);
-                    ctx.Response.OutputStream.Flush();
+                    await ctx.Response.OutputStream.WriteAsync(buffer, 0, read).ConfigureAwait(false);
                     totalBytes += read;
                 }
                 else
                 {
-                    Thread.Sleep(10); // No data yet, wait briefly
+                    await encoder.WaitForDataAsync(50).ConfigureAwait(false);
                 }
             }
         }
@@ -216,7 +223,7 @@ public sealed class MjpegServer : IDisposable
                 if (p?.ExitCode == 0) { ResoniteMod.Msg($"[FFmpeg] Found: {c}"); return c; }
                 ResoniteMod.Msg($"[FFmpeg] Not valid: {c} (exit={p?.ExitCode})");
             }
-            catch (Exception ex) { ResoniteMod.Msg($"[FFmpeg] Failed: {c} ({ex.Message})"); }
+            catch (Exception ex) { ResoniteMod.Msg($"[FFmpeg] {c}: {ex.Message}"); }
         }
         ResoniteMod.Msg("[FFmpeg] NOT FOUND in any search path");
         return null;

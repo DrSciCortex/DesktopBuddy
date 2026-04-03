@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "build": "dotnet build DesktopBuddy/DesktopBuddy.csproj",
+    "build": "taskkill /F /IM Resonite.exe 2>nul & taskkill /F /IM Renderite.Host.exe 2>nul & dotnet build DesktopBuddy/DesktopBuddy.csproj",
     "package": "dotnet build DesktopBuddy/DesktopBuddy.csproj && node scripts/package.js"
   }
 }
