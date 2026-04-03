@@ -4,7 +4,7 @@
       <InputAssemblies Include="$(OutputPath)$(TargetName)$(TargetExt)" />
       <InputAssemblies Include="$(OutputPath)Microsoft.Windows.SDK.NET.dll" />
       <InputAssemblies Include="$(OutputPath)WinRT.Runtime.dll" />
-      <InputAssemblies Include="$(OutputPath)NvEncSharp.dll" />
+      <InputAssemblies Include="$(OutputPath)FFmpeg.AutoGen.dll" />
     </ItemGroup>
 
     <ILRepack

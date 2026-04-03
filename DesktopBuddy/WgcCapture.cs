@@ -509,26 +509,25 @@ public sealed class WgcCapture : IDisposable
         DeviceCreateTexture2D(_d3dDevice, ref desc, IntPtr.Zero, out _encodeTexture);
         _encodeTexW = w; _encodeTexH = h;
 
-        // Start keepalive thread if not already running
-        if (_keepaliveThread == null)
-        {
-            _keepaliveThread = new Thread(() =>
-            {
-                while (!_disposed)
-                {
-                    Thread.Sleep(50); // 20fps keepalive check
-                    if (_disposed || OnGpuFrame == null || _encodeTexture == IntPtr.Zero) continue;
-                    // Only send keepalive if WGC hasn't fired recently
-                    long msSinceFrame = (DateTime.UtcNow.Ticks - Interlocked.Read(ref _lastFrameTicks)) / TimeSpan.TicksPerMillisecond;
-                    if (msSinceFrame > 100) // 100ms idle = send keepalive
-                    {
-                        try { OnGpuFrame.Invoke(_d3dDevice, _encodeTexture, _encodeTexW, _encodeTexH); }
-                        catch (Exception kaEx) { ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] Keepalive error: {kaEx.Message}"); }
-                    }
-                }
-            }) { IsBackground = true, Name = "WGC_Keepalive" };
-            _keepaliveThread.Start();
-        }
+        // Keepalive disabled — FFmpeg encoder handles idle frames via pause detection
+        // if (_keepaliveThread == null)
+        // {
+        //     _keepaliveThread = new Thread(() =>
+        //     {
+        //         while (!_disposed)
+        //         {
+        //             Thread.Sleep(50);
+        //             if (_disposed || OnGpuFrame == null || _encodeTexture == IntPtr.Zero) continue;
+        //             long msSinceFrame = (DateTime.UtcNow.Ticks - Interlocked.Read(ref _lastFrameTicks)) / TimeSpan.TicksPerMillisecond;
+        //             if (msSinceFrame > 100)
+        //             {
+        //                 try { OnGpuFrame.Invoke(_d3dDevice, _encodeTexture, _encodeTexW, _encodeTexH); }
+        //                 catch (Exception kaEx) { ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] Keepalive error: {kaEx.Message}"); }
+        //             }
+        //         }
+        //     }) { IsBackground = true, Name = "WGC_Keepalive" };
+        //     _keepaliveThread.Start();
+        // }
     }
 
     private long _lastFrameTicks;

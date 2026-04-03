@@ -15,10 +15,7 @@
   <ItemGroup>
     <PackageReference Include="Lib.Harmony" Version="2.3.3" />
     <PackageReference Include="ILRepack.Lib.MSBuild.Task" Version="2.0.34" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="..\..\NvEncSharp\src\NvEncSharp\NvEncSharp.csproj" />
+    <PackageReference Include="FFmpeg.AutoGen" Version="7.1.1" />
   </ItemGroup>
 
   <ItemGroup>
@@ -73,9 +70,10 @@
     <EmbeddedResource Include="$(IntermediateOutputPath)BgraToRgba.cso" LogicalName="DesktopBuddy.Shaders.BgraToRgba.cso" />
   </ItemGroup>
 
-  <!-- Copy merged DLL to rml_mods -->
+  <!-- Copy merged DLL to rml_mods + FFmpeg native DLLs to Resonite/ffmpeg/ -->
   <Target Name="CopyToResonite" AfterTargets="ILRepackMerge">
     <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(ResonitePath)\rml_mods" ContinueOnError="true" />
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)..\ffmpeg\avcodec-61.dll;$(MSBuildThisFileDirectory)..\ffmpeg\avformat-61.dll;$(MSBuildThisFileDirectory)..\ffmpeg\avutil-59.dll;$(MSBuildThisFileDirectory)..\ffmpeg\swresample-5.dll;$(MSBuildThisFileDirectory)..\ffmpeg\swscale-8.dll" DestinationFolder="$(ResonitePath)\ffmpeg" ContinueOnError="true" />
   </Target>
 
 </Project>

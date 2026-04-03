@@ -14,7 +14,7 @@ namespace DesktopBuddy;
 public sealed class PerfTimer : IDisposable
 {
     private readonly Stopwatch _reportSw = Stopwatch.StartNew();
-    private const int REPORT_INTERVAL_MS = 30_000;
+    private const int REPORT_INTERVAL_MS = 5_000;
 
     // Per-step accumulators (lock-free via Interlocked)
     private readonly Dictionary<string, StepStats> _steps = new();

@@ -21,7 +21,7 @@ public sealed class MjpegServer : IDisposable
     private volatile bool _running;
     private readonly int _port;
 
-    private readonly ConcurrentDictionary<int, NvEncHlsEncoder> _encoders = new();
+    private readonly ConcurrentDictionary<int, FfmpegEncoder> _encoders = new();
 
     public int Port => _port;
 
@@ -75,11 +75,11 @@ public sealed class MjpegServer : IDisposable
         _ = ListenLoopAsync();
     }
 
-    public NvEncHlsEncoder CreateEncoder(int streamId)
+    public FfmpegEncoder CreateEncoder(int streamId)
     {
-        var enc = new NvEncHlsEncoder(streamId, Path.Combine(Path.GetTempPath(), $"DesktopBuddy_{streamId}"));
+        var enc = new FfmpegEncoder(streamId);
         _encoders[streamId] = enc;
-        ResoniteMod.Msg($"[MjpegServer] Created NVENC encoder for stream {streamId}");
+        ResoniteMod.Msg($"[MjpegServer] Created encoder for stream {streamId}");
         return enc;
     }
 
@@ -198,34 +198,4 @@ public sealed class MjpegServer : IDisposable
         try { _listener.Close(); } catch { }
     }
 
-    internal static string FindFfmpeg()
-    {
-        // Search relative to mod DLL, Resonite root, common install paths, and PATH
-        var modDir = Path.GetDirectoryName(typeof(MjpegServer).Assembly.Location) ?? "";
-        string[] candidates = {
-            Path.Combine(modDir, "..", "ffmpeg", "ffmpeg.exe"),           // rml_mods/../ffmpeg/
-            Path.Combine(modDir, "ffmpeg", "ffmpeg.exe"),                 // rml_mods/ffmpeg/
-            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ffmpeg", "ffmpeg.exe"), // Resonite/ffmpeg/
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "ffmpeg", "bin", "ffmpeg.exe"),
-            "ffmpeg" // PATH
-        };
-        foreach (var c in candidates)
-        {
-            try
-            {
-                ResoniteMod.Msg($"[FFmpeg] Trying: {c}");
-                var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = c, Arguments = "-version",
-                    RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true
-                });
-                p?.WaitForExit(2000);
-                if (p?.ExitCode == 0) { ResoniteMod.Msg($"[FFmpeg] Found: {c}"); return c; }
-                ResoniteMod.Msg($"[FFmpeg] Not valid: {c} (exit={p?.ExitCode})");
-            }
-            catch (Exception ex) { ResoniteMod.Msg($"[FFmpeg] {c}: {ex.Message}"); }
-        }
-        ResoniteMod.Msg("[FFmpeg] NOT FOUND in any search path");
-        return null;
-    }
 }

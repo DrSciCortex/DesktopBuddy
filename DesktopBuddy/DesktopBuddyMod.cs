@@ -39,7 +39,7 @@ public class DesktopBuddyMod : ResoniteMod
     private class SharedStream
     {
         public int StreamId;
-        public NvEncHlsEncoder Encoder;
+        public FfmpegEncoder Encoder;
         public Uri StreamUrl;
         public int RefCount;
     }
@@ -47,6 +47,7 @@ public class DesktopBuddyMod : ResoniteMod
     internal static MjpegServer? StreamServer;
     private const int STREAM_PORT = 48080;
     internal static string? TunnelUrl; // Set by cloudflared if available
+    private static Process _tunnelProcess;
     internal static readonly PerfTimer Perf = new();
 
     public override void OnEngineInit()
@@ -75,6 +76,13 @@ public class DesktopBuddyMod : ResoniteMod
         {
             System.Threading.Tasks.Task.Run(() => StartTunnel());
         }
+
+        // Kill cloudflared when the process exits
+        AppDomain.CurrentDomain.ProcessExit += (s, e) =>
+        {
+            try { if (_tunnelProcess != null && !_tunnelProcess.HasExited) _tunnelProcess.Kill(); }
+            catch (Exception ex) { Msg($"[Tunnel] Kill failed: {ex.Message}"); }
+        };
 
         Msg("DesktopBuddy initialized!");
     }
@@ -437,17 +445,17 @@ public class DesktopBuddyMod : ResoniteMod
             }
         };
 
-        // Resync button — reloads the video stream by clearing and re-setting the URL
+        // Resync button — forces libVLC to fully disconnect and reconnect
         resyncBtn.LocalPressed += (IButton b, ButtonEventData d) =>
         {
             Msg("[Resync] Button pressed");
             if (videoTexRef != null && !videoTexRef.IsDestroyed)
             {
                 var savedUrl = videoTexRef.URL.Value;
-                Msg($"[Resync] Resetting stream URL: {savedUrl}");
+                Msg($"[Resync] Forcing full reload: {savedUrl}");
                 videoTexRef.URL.Value = null;
-                // Re-set URL next frame so FreeAsset completes first
-                root.World.RunInUpdates(1, () =>
+                // Wait several frames so FreeAsset fully tears down the player
+                root.World.RunInUpdates(10, () =>
                 {
                     if (videoTexRef != null && !videoTexRef.IsDestroyed)
                     {
@@ -922,11 +930,10 @@ public class DesktopBuddyMod : ResoniteMod
             // Check if cloudflared is available
             var modDir = System.IO.Path.GetDirectoryName(typeof(DesktopBuddyMod).Assembly.Location) ?? "";
             string[] candidates = {
-                System.IO.Path.Combine(modDir, "..", "cloudflared", "cloudflared.exe"), // rml_mods/../cloudflared/
+                System.IO.Path.Combine(modDir, "..", "cloudflared", "cloudflared.exe"),
                 System.IO.Path.Combine(modDir, "cloudflared", "cloudflared.exe"),
                 System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "cloudflared", "cloudflared.exe"),
-                @"C:\Program Files (x86)\cloudflared\cloudflared.exe",
-                "cloudflared" // PATH
+                "cloudflared"
             };
             string cfPath = null;
             foreach (var c in candidates)
@@ -940,7 +947,7 @@ public class DesktopBuddyMod : ResoniteMod
                         UseShellExecute = false, CreateNoWindow = true
                     });
                     p?.WaitForExit(3000);
-                    if (p?.ExitCode == 0) { cfPath = c; break; }
+                    if (p?.ExitCode == 0) { cfPath = c; Msg($"[Tunnel] Found cloudflared: {c}"); break; }
                 }
                 catch { }
             }
@@ -962,8 +969,9 @@ public class DesktopBuddyMod : ResoniteMod
                 UseShellExecute = false,
                 CreateNoWindow = true,
             };
-            var proc = Process.Start(psi);
-            if (proc == null) { Msg("[Tunnel] Failed to start cloudflared"); return; }
+            _tunnelProcess = Process.Start(psi);
+            if (_tunnelProcess == null) { Msg("[Tunnel] Failed to start cloudflared"); return; }
+            var proc = _tunnelProcess;
 
             // cloudflared prints the tunnel URL to stderr
             proc.ErrorDataReceived += (s, e) =>

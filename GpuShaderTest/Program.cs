@@ -68,8 +68,14 @@ unsafe class Program
 
     static IntPtr device, context;
 
-    static void Main()
+    static void Main(string[] args)
     {
+        if (args.Length > 0 && args[0] == "ffmpeg")
+        {
+            FfmpegEncoderTest.Run();
+            return;
+        }
+
         Console.WriteLine("=== GPU Compute Shader Test ===");
 
         // Create device with debug layer
