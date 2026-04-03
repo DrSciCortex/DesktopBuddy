@@ -13,7 +13,10 @@ namespace DesktopBuddy;
 public static class WindowIconExtractor
 {
     [DllImport("user32.dll")]
-    private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    private static extern IntPtr SendMessageTimeoutW(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam,
+        uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
+
+    private const uint SMTO_ABORTIFHUNG = 0x0002;
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetClassLongPtr(IntPtr hWnd, int nIndex);
@@ -105,9 +108,23 @@ public static class WindowIconExtractor
     {
         width = height = 0;
 
-        IntPtr hIcon = SendMessage(hwnd, WM_GETICON, (IntPtr)ICON_BIG, IntPtr.Zero);
-        if (hIcon == IntPtr.Zero)
-            hIcon = SendMessage(hwnd, WM_GETICON, (IntPtr)ICON_SMALL2, IntPtr.Zero);
+        // Use SendMessageTimeout with SMTO_ABORTIFHUNG to avoid freezing on unresponsive windows
+        IntPtr hIcon = IntPtr.Zero;
+        var swIcon = System.Diagnostics.Stopwatch.StartNew();
+        IntPtr resultBig = SendMessageTimeoutW(hwnd, WM_GETICON, (IntPtr)ICON_BIG, IntPtr.Zero, SMTO_ABORTIFHUNG, 200, out hIcon);
+        if (resultBig == IntPtr.Zero && hIcon == IntPtr.Zero)
+        {
+            long ms = swIcon.ElapsedMilliseconds;
+            if (ms >= 180)
+            {
+                // Timed out — identify the culprit
+                GetWindowThreadProcessId(hwnd, out uint pid);
+                string name = "unknown";
+                try { name = System.Diagnostics.Process.GetProcessById((int)pid)?.ProcessName ?? "unknown"; } catch { }
+                ResoniteMod.Msg($"[IconExtractor] WM_GETICON timed out after {ms}ms for hwnd={hwnd} pid={pid} process={name}");
+            }
+            SendMessageTimeoutW(hwnd, WM_GETICON, (IntPtr)ICON_SMALL2, IntPtr.Zero, SMTO_ABORTIFHUNG, 200, out hIcon);
+        }
         if (hIcon == IntPtr.Zero)
             hIcon = GetClassLongPtr(hwnd, GCL_HICON);
         if (hIcon == IntPtr.Zero)

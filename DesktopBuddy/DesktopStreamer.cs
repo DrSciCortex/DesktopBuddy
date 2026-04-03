@@ -17,6 +17,13 @@ public sealed class DesktopStreamer : IDisposable
     public bool IsValid => _wgc?.IsValid ?? false;
     public bool UsingWgc => true;
 
+    public Action<IntPtr, IntPtr, int, int> OnGpuFrame
+    {
+        get => _wgc?.OnGpuFrame;
+        set { if (_wgc != null) _wgc.OnGpuFrame = value; }
+    }
+
+
     public DesktopStreamer(IntPtr hwnd)
     {
         _hwnd = hwnd;

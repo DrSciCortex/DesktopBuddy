@@ -1,22 +1,17 @@
 using System;
-using System.Collections.Generic;
-using System.Diagnostics;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
-using System.Text;
 using System.Threading;
 using ResoniteModLoader;
 
 namespace DesktopBuddy;
 
 /// <summary>
-/// HTTP server that serves MPEG-TS video streams encoded from WGC capture frames via FFmpeg.
-/// Frames come from DesktopSession.StreamFrame (set by the update loop, one pointer assignment).
-/// A feeder thread reads frames at 30fps and pipes raw RGBA to FFmpeg stdin.
-/// FFmpeg encodes to H.264 MPEG-TS on stdout, served to HTTP clients.
+/// HTTP server serving MPEG-TS streams from NvEncHlsEncoder (NVENC GPU + FFmpeg muxing).
+/// NVENC encodes on GPU → tiny H.264 piped to FFmpeg → MPEG-TS stdout → HTTP to clients.
 ///
-/// Endpoints:
-///   GET /stream?session={index}  → MPEG-TS stream for a specific session (0-based index into ActiveSessions)
+/// GET /stream/{streamId} → continuous MPEG-TS stream
 /// </summary>
 public sealed class MjpegServer : IDisposable
 {
@@ -25,11 +20,7 @@ public sealed class MjpegServer : IDisposable
     private volatile bool _running;
     private readonly int _port;
 
-    private readonly List<Process> _ffmpegProcesses = new();
-    private readonly object _processLock = new();
-
-    // Track active stream per session to kill old one on retry
-    private readonly Dictionary<int, Process> _activeStreams = new();
+    private readonly ConcurrentDictionary<int, NvEncHlsEncoder> _encoders = new();
 
     public int Port => _port;
 
@@ -49,15 +40,52 @@ public sealed class MjpegServer : IDisposable
             _listener.Start();
             ResoniteMod.Msg($"[MjpegServer] Listening on http://+:{_port}/");
         }
-        catch
+        catch (Exception ex)
         {
+            ResoniteMod.Msg($"[MjpegServer] http://+ failed ({ex.Message}), adding urlacl...");
+            // Try to add urlacl so http://+ works (needed for cloudflare tunnel Host header)
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "netsh",
+                    Arguments = $"http add urlacl url=http://+:{_port}/ user=Everyone",
+                    UseShellExecute = true,
+                    Verb = "runas",
+                    CreateNoWindow = true,
+                    WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden
+                };
+                var proc = System.Diagnostics.Process.Start(psi);
+                proc?.WaitForExit(5000);
+                ResoniteMod.Msg($"[MjpegServer] urlacl result: {proc?.ExitCode}");
+            }
+            catch (Exception urlEx)
+            {
+                ResoniteMod.Msg($"[MjpegServer] urlacl failed: {urlEx.Message}");
+            }
+
+            // Retry http://+
             _listener.Close();
             _listener = new HttpListener();
-            _listener.Prefixes.Add($"http://localhost:{_port}/");
+            _listener.Prefixes.Add($"http://+:{_port}/");
             _listener.Start();
-            ResoniteMod.Msg($"[MjpegServer] Listening on http://localhost:{_port}/ (run 'netsh http add urlacl url=http://+:48080/ user=Everyone' as admin for tunnel)");
+            ResoniteMod.Msg($"[MjpegServer] Listening on http://+:{_port}/ (after urlacl)");
         }
         _listenThread.Start();
+    }
+
+    public NvEncHlsEncoder CreateEncoder(int streamId)
+    {
+        var enc = new NvEncHlsEncoder(streamId, Path.Combine(Path.GetTempPath(), $"DesktopBuddy_{streamId}"));
+        _encoders[streamId] = enc;
+        ResoniteMod.Msg($"[MjpegServer] Created NVENC encoder for stream {streamId}");
+        return enc;
+    }
+
+    public void StopEncoder(int streamId)
+    {
+        if (_encoders.TryRemove(streamId, out var enc))
+            enc.Dispose();
     }
 
     private void ListenLoop()
@@ -79,8 +107,8 @@ public sealed class MjpegServer : IDisposable
         try
         {
             var path = ctx.Request.Url?.AbsolutePath ?? "/";
-            if (path.StartsWith("/stream"))
-                ServeStream(ctx);
+            if (path.StartsWith("/stream/"))
+                ServeStream(ctx, path);
             else
             {
                 ctx.Response.StatusCode = 404;
@@ -90,262 +118,107 @@ public sealed class MjpegServer : IDisposable
         catch { try { ctx.Response.Close(); } catch { } }
     }
 
-    private void ServeStream(HttpListenerContext ctx)
+    private void ServeStream(HttpListenerContext ctx, string urlPath)
     {
-        var remoteAddr = ctx.Request.RemoteEndPoint;
-        var hostHeader = ctx.Request.Headers["Host"];
-        var rawUrl = ctx.Request.RawUrl;
-        ResoniteMod.Msg($"[MjpegServer] Stream request from {remoteAddr} Host={hostHeader} URL={rawUrl}");
+        var parts = urlPath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2) { ctx.Response.StatusCode = 404; ctx.Response.Close(); return; }
 
-        var sessionStr = ctx.Request.QueryString["session"];
-        int sessionIdx = 0;
-        if (sessionStr != null) int.TryParse(sessionStr, out sessionIdx);
-
-        if (sessionIdx < 0 || sessionIdx >= DesktopBuddyMod.ActiveSessions.Count)
+        if (!int.TryParse(parts[1], out int streamId) || !_encoders.TryGetValue(streamId, out var encoder))
         {
-            ResoniteMod.Msg($"[MjpegServer] Session {sessionIdx} not found, {DesktopBuddyMod.ActiveSessions.Count} active");
+            ResoniteMod.Msg($"[MjpegServer] Stream {streamId} not found");
             ctx.Response.StatusCode = 404;
             ctx.Response.Close();
             return;
         }
 
-        var session = DesktopBuddyMod.ActiveSessions[sessionIdx];
-        int w = session.StreamWidth > 0 ? session.StreamWidth : 1920;
-        int h = session.StreamHeight > 0 ? session.StreamHeight : 1080;
-
-        // Kill any existing stream for this session (VideoTextureProvider retries cause duplicates)
-        lock (_processLock)
+        // Wait for encoder to be ready
+        int waitCount = 0;
+        while (!encoder.IsRunning && waitCount < 50)
         {
-            if (_activeStreams.TryGetValue(sessionIdx, out var oldProc))
-            {
-                ResoniteMod.Msg($"[MjpegServer] Killing old FFmpeg for session {sessionIdx} PID={oldProc.Id}");
-                try { oldProc.Kill(); } catch { }
-                _activeStreams.Remove(sessionIdx);
-            }
+            Thread.Sleep(100);
+            waitCount++;
         }
-
-        var ffmpegPath = FindFfmpeg();
-        if (ffmpegPath == null)
+        if (!encoder.IsRunning)
         {
-            ResoniteMod.Msg($"[MjpegServer] FFmpeg not found");
-            ctx.Response.StatusCode = 500;
+            ResoniteMod.Msg($"[MjpegServer] Stream {streamId} encoder not ready after {waitCount * 100}ms");
+            ctx.Response.StatusCode = 503;
             ctx.Response.Close();
             return;
         }
 
-        string encoder = DetectEncoder(ffmpegPath);
-
-        // Build encoder options
-        string encoderOpts;
-        if (encoder == "h264_nvenc")
-            encoderOpts = $"-c:v {encoder} -preset p1 -tune ll -rc vbr -cq 23 -b:v 8M -maxrate 12M";
-        else if (encoder == "h264_qsv")
-            encoderOpts = $"-c:v {encoder} -global_quality 23";
-        else if (encoder == "h264_amf")
-            encoderOpts = $"-c:v {encoder} -quality speed -rc cqp -qp_i 23 -qp_p 23";
-        else
-            encoderOpts = $"-c:v {encoder} -preset ultrafast -tune zerolatency -crf 23";
-
-        // FFmpeg reads raw RGBA from stdin, encodes to H.264 MPEG-TS on stdout
-        // vflip: WGC buffer is Y-flipped for GPU upload, need to flip back for video
-        // scale: NVENC H.264 max width is 4096
-        string scaleOpt = (encoder == "h264_nvenc" && w > 4096) ? ",scale=4096:-2" : "";
-        string args = $"-f rawvideo -pixel_format rgba -video_size {w}x{h} -framerate 30 -i pipe:0 " +
-                      $"-vf \"vflip{scaleOpt}\" -pix_fmt yuv420p {encoderOpts} -bf 0 -g 15 " +
-                      $"-f mpegts -an pipe:1";
-
-        ResoniteMod.Msg($"[MjpegServer] Starting FFmpeg: {ffmpegPath} {args}");
-
-        var psi = new ProcessStartInfo
-        {
-            FileName = ffmpegPath,
-            Arguments = args,
-            UseShellExecute = false,
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-        };
-
-        Process ffmpeg;
-        try
-        {
-            ffmpeg = Process.Start(psi)!;
-            ResoniteMod.Msg($"[MjpegServer] FFmpeg started PID={ffmpeg.Id} for session {sessionIdx} ({w}x{h})");
-        }
-        catch (Exception ex)
-        {
-            ResoniteMod.Msg($"[MjpegServer] FFmpeg start FAILED: {ex.Message}");
-            ctx.Response.StatusCode = 500;
-            ctx.Response.Close();
-            return;
-        }
-
-        ffmpeg.ErrorDataReceived += (s, e) =>
-        {
-            if (e.Data != null)
-                ResoniteMod.Msg($"[FFmpeg:{ffmpeg.Id}] {e.Data}");
-        };
-        ffmpeg.BeginErrorReadLine();
-        lock (_processLock)
-        {
-            _ffmpegProcesses.Add(ffmpeg);
-            _activeStreams[sessionIdx] = ffmpeg;
-        }
-
-        // Feeder thread: reads WGC frames from session, writes to FFmpeg stdin at 30fps
-        var feederThread = new Thread(() =>
-        {
-            try
-            {
-                var stdin = ffmpeg.StandardInput.BaseStream;
-                int frameCount = 0;
-                while (_running && !ffmpeg.HasExited && session.Root != null && !session.Root.IsDestroyed)
-                {
-                    byte[] frame = null;
-                    int fw = 0, fh = 0;
-                    lock (session.StreamLock)
-                    {
-                        // Wait for a new frame (up to 100ms)
-                        if (!session.StreamFrameReady)
-                            Monitor.Wait(session.StreamLock, 100);
-                        if (session.StreamFrameReady)
-                        {
-                            frame = session.StreamFrame;
-                            fw = session.StreamWidth;
-                            fh = session.StreamHeight;
-                            session.StreamFrameReady = false;
-                        }
-                    }
-                    if (frame != null && fw == w && fh == h)
-                    {
-                        try
-                        {
-                            stdin.Write(frame, 0, fw * fh * 4);
-                            stdin.Flush();
-                            frameCount++;
-                            if (frameCount <= 3 || frameCount % 300 == 0)
-                                ResoniteMod.Msg($"[MjpegServer] Fed frame #{frameCount} to FFmpeg ({fw}x{fh})");
-                        }
-                        catch { break; }
-                    }
-                    else if (frame != null && (fw != w || fh != h))
-                    {
-                        // Resolution changed — need to restart FFmpeg
-                        ResoniteMod.Msg($"[MjpegServer] Resolution changed {w}x{h} -> {fw}x{fh}, ending stream");
-                        break;
-                    }
-                }
-                try { stdin.Close(); } catch { }
-                ResoniteMod.Msg($"[MjpegServer] Feeder done, fed {frameCount} frames");
-            }
-            catch (Exception ex)
-            {
-                ResoniteMod.Msg($"[MjpegServer] Feeder error: {ex.Message}");
-            }
-        }) { IsBackground = true, Name = $"DesktopBuddy_Feeder_{sessionIdx}" };
-        feederThread.Start();
-
-        // Serve FFmpeg stdout to HTTP response
+        ResoniteMod.Msg($"[MjpegServer] Serving stream {streamId} to {ctx.Request.RemoteEndPoint}");
         ctx.Response.ContentType = "video/mp2t";
         ctx.Response.SendChunked = true;
         ctx.Response.StatusCode = 200;
 
         long totalBytes = 0;
-        int readCount = 0;
+        long readPos = 0; // Start from latest data
         try
         {
             var buffer = new byte[65536];
-            var stdout = ffmpeg.StandardOutput.BaseStream;
-            ResoniteMod.Msg($"[MjpegServer] Serving stream to client...");
-            while (_running && !ffmpeg.HasExited)
+            while (_running && encoder.IsRunning)
             {
-                int read = stdout.Read(buffer, 0, buffer.Length);
-                if (read <= 0) break;
-                ctx.Response.OutputStream.Write(buffer, 0, read);
-                ctx.Response.OutputStream.Flush();
-                totalBytes += read;
-                readCount++;
-                if (readCount <= 3 || readCount % 300 == 0)
-                    ResoniteMod.Msg($"[MjpegServer] Sent chunk #{readCount}: {read} bytes (total: {totalBytes})");
+                int read = encoder.ReadStream(buffer, ref readPos);
+                if (read > 0)
+                {
+                    ctx.Response.OutputStream.Write(buffer, 0, read);
+                    ctx.Response.OutputStream.Flush();
+                    totalBytes += read;
+                }
+                else
+                {
+                    Thread.Sleep(10); // No data yet, wait briefly
+                }
             }
         }
         catch (Exception ex)
         {
-            ResoniteMod.Msg($"[MjpegServer] Stream exception: {ex.GetType().Name}: {ex.Message}");
+            ResoniteMod.Msg($"[MjpegServer] Stream {streamId} error: {ex.GetType().Name}: {ex.Message}");
         }
         finally
         {
-            try { if (!ffmpeg.HasExited) ffmpeg.Kill(); } catch { }
-            lock (_processLock)
-            {
-                _ffmpegProcesses.Remove(ffmpeg);
-                if (_activeStreams.TryGetValue(sessionIdx, out var cur) && cur == ffmpeg)
-                    _activeStreams.Remove(sessionIdx);
-            }
             try { ctx.Response.Close(); } catch { }
-            ResoniteMod.Msg($"[MjpegServer] Stream ended session={sessionIdx}. Total: {totalBytes} bytes, {readCount} chunks");
+            ResoniteMod.Msg($"[MjpegServer] Stream {streamId} ended, sent {totalBytes} bytes");
         }
-    }
-
-    private static string? _cachedEncoder;
-
-    private static string DetectEncoder(string ffmpegPath)
-    {
-        if (_cachedEncoder != null) return _cachedEncoder;
-        string[] encoders = { "h264_nvenc", "h264_amf", "h264_qsv", "libx264" };
-        foreach (var enc in encoders)
-        {
-            try
-            {
-                var p = Process.Start(new ProcessStartInfo
-                {
-                    FileName = ffmpegPath,
-                    Arguments = $"-f lavfi -i nullsrc=s=256x256:d=0.1 -c:v {enc} -f null -",
-                    RedirectStandardOutput = true, RedirectStandardError = true,
-                    UseShellExecute = false, CreateNoWindow = true
-                });
-                p?.WaitForExit(3000);
-                if (p?.ExitCode == 0) { _cachedEncoder = enc; return enc; }
-            }
-            catch { }
-        }
-        _cachedEncoder = "libx264";
-        return "libx264";
-    }
-
-    private static string? FindFfmpeg()
-    {
-        string[] candidates = {
-            @"C:\bins\ffmpeg.exe",
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "ffmpeg", "bin", "ffmpeg.exe"),
-            "ffmpeg"
-        };
-        foreach (var c in candidates)
-        {
-            try
-            {
-                var p = Process.Start(new ProcessStartInfo { FileName = c, Arguments = "-version", RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true });
-                p?.WaitForExit(1000);
-                if (p?.ExitCode == 0) return c;
-            }
-            catch { }
-        }
-        return null;
     }
 
     public void Dispose()
     {
         _running = false;
-        lock (_processLock)
-        {
-            foreach (var p in _ffmpegProcesses)
-            {
-                try { p.Kill(); } catch { }
-            }
-            _ffmpegProcesses.Clear();
-        }
+        foreach (var kvp in _encoders) kvp.Value.Dispose();
+        _encoders.Clear();
         try { _listener.Stop(); } catch { }
         try { _listener.Close(); } catch { }
+    }
+
+    internal static string FindFfmpeg()
+    {
+        // Search relative to mod DLL, Resonite root, common install paths, and PATH
+        var modDir = Path.GetDirectoryName(typeof(MjpegServer).Assembly.Location) ?? "";
+        string[] candidates = {
+            Path.Combine(modDir, "..", "ffmpeg", "ffmpeg.exe"),           // rml_mods/../ffmpeg/
+            Path.Combine(modDir, "ffmpeg", "ffmpeg.exe"),                 // rml_mods/ffmpeg/
+            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ffmpeg", "ffmpeg.exe"), // Resonite/ffmpeg/
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "ffmpeg", "bin", "ffmpeg.exe"),
+            "ffmpeg" // PATH
+        };
+        foreach (var c in candidates)
+        {
+            try
+            {
+                ResoniteMod.Msg($"[FFmpeg] Trying: {c}");
+                var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = c, Arguments = "-version",
+                    RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true
+                });
+                p?.WaitForExit(2000);
+                if (p?.ExitCode == 0) { ResoniteMod.Msg($"[FFmpeg] Found: {c}"); return c; }
+                ResoniteMod.Msg($"[FFmpeg] Not valid: {c} (exit={p?.ExitCode})");
+            }
+            catch (Exception ex) { ResoniteMod.Msg($"[FFmpeg] Failed: {c} ({ex.Message})"); }
+        }
+        ResoniteMod.Msg("[FFmpeg] NOT FOUND in any search path");
+        return null;
     }
 }

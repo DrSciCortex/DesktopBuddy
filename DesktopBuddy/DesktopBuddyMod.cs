@@ -28,9 +28,21 @@ public class DesktopBuddyMod : ResoniteMod
         new("frameRate", "Target capture frame rate", () => 30);
 
     internal static readonly List<DesktopSession> ActiveSessions = new();
+    private static int _nextStreamId;
 
     // Track our desktop canvases so the locomotion patch can identify them
     internal static readonly HashSet<RefID> DesktopCanvasIds = new();
+
+    // Shared stream registry: multiple panels for the same hwnd share one encoder
+    private static readonly Dictionary<IntPtr, SharedStream> _sharedStreams = new();
+
+    private class SharedStream
+    {
+        public int StreamId;
+        public NvEncHlsEncoder Encoder;
+        public Uri StreamUrl;
+        public int RefCount;
+    }
 
     internal static MjpegServer? StreamServer;
     private const int STREAM_PORT = 48080;
@@ -160,6 +172,7 @@ public class DesktopBuddyMod : ResoniteMod
             Canvas = ui.Canvas,
             Root = root,
             TargetInterval = 1.0 / fps,
+            Hwnd = hwnd,
         };
         ActiveSessions.Add(session);
         DesktopCanvasIds.Add(ui.Canvas.ReferenceID);
@@ -349,6 +362,7 @@ public class DesktopBuddyMod : ResoniteMod
 
         var kbBtn = btnBarUi.Button("Keyboard");
         var testStreamBtn = btnBarUi.Button("Test Stream");
+        var resyncBtn = btnBarUi.Button("Resync");
         var anchorBtn = btnBarUi.Button("Anchor");
         Msg($"[StartStreaming] Button bar created at y={btnBarSlot.LocalPosition.y:F4}");
 
@@ -402,6 +416,7 @@ public class DesktopBuddyMod : ResoniteMod
         Slot streamSlotRef = null; // Will be set when stream is created below
         bool streamTestMode = false;
         ValueUserOverride<bool> streamVisRef = null; // Set when stream is created
+        VideoTextureProvider videoTexRef = null; // Set when stream is created
         testStreamBtn.LocalPressed += (IButton b, ButtonEventData d) =>
         {
             Msg("[TestStream] Button pressed");
@@ -418,6 +433,31 @@ public class DesktopBuddyMod : ResoniteMod
             else
             {
                 Msg("[TestStream] No stream available");
+            }
+        };
+
+        // Resync button — reloads the video stream by clearing and re-setting the URL
+        resyncBtn.LocalPressed += (IButton b, ButtonEventData d) =>
+        {
+            Msg("[Resync] Button pressed");
+            if (videoTexRef != null && !videoTexRef.IsDestroyed)
+            {
+                var savedUrl = videoTexRef.URL.Value;
+                Msg($"[Resync] Resetting stream URL: {savedUrl}");
+                videoTexRef.URL.Value = null;
+                // Re-set URL next frame so FreeAsset completes first
+                root.World.RunInUpdates(1, () =>
+                {
+                    if (videoTexRef != null && !videoTexRef.IsDestroyed)
+                    {
+                        videoTexRef.URL.Value = savedUrl;
+                        Msg($"[Resync] URL restored: {savedUrl}");
+                    }
+                });
+            }
+            else
+            {
+                Msg("[Resync] No stream available");
             }
         };
 
@@ -565,43 +605,86 @@ public class DesktopBuddyMod : ResoniteMod
         }
 
         // --- Remote stream: WGC frames → FFmpeg → MPEG-TS → CloudFlare tunnel → VideoTextureProvider ---
-        // Shown at main display position. For testing: inverted so local user sees the stream too.
+        // Multiple panels for the same hwnd share one encoder (saves GPU/CPU).
         if (StreamServer != null && TunnelUrl != null)
         {
             try
             {
-                int sessionIdx = ActiveSessions.Count - 1; // This session was just added
-                var streamUrl = new Uri($"{TunnelUrl}/stream?session={sessionIdx}");
+                // Look up or create shared stream for this hwnd
+                // Monitors have hwnd=0 — never share those, each is a different capture
+                SharedStream shared;
+                lock (_sharedStreams)
+                {
+                    if (hwnd == IntPtr.Zero || !_sharedStreams.TryGetValue(hwnd, out shared))
+                    {
+                        int streamId = System.Threading.Interlocked.Increment(ref _nextStreamId);
+                        var encoder = StreamServer.CreateEncoder(streamId);
+                        var url = new Uri($"{TunnelUrl}/stream/{streamId}");
+                        shared = new SharedStream { StreamId = streamId, Encoder = encoder, StreamUrl = url, RefCount = 0 };
+                        if (hwnd != IntPtr.Zero)
+                            _sharedStreams[hwnd] = shared;
+                        Msg($"[RemoteStream] Created new shared stream {streamId} for hwnd={hwnd}");
+                    }
+                    else
+                    {
+                        Msg($"[RemoteStream] Reusing shared stream {shared.StreamId} for hwnd={hwnd} (refs={shared.RefCount})");
+                    }
+                    shared.RefCount++;
+                }
+                session.StreamId = shared.StreamId;
+                var nvEncoder = shared.Encoder;
 
-                // Stream at same position as display — per-user visibility controls who sees what
-                var streamSlot = root.AddSlot("RemoteStream");
+                // Hook NVENC directly into WGC — encodes on GPU, tiny bitstream piped to FFmpeg for HLS muxing
+                // Only the first panel's WGC drives the encoder; additional panels skip encoding
+                // (all WGC captures for the same hwnd produce identical frames)
+                bool isFirstForHwnd = shared.RefCount == 1;
+                if (isFirstForHwnd)
+                {
+                    session.Streamer.OnGpuFrame = (device, texture, fw, fh) =>
+                    {
+                        if (!nvEncoder.IsInitialized)
+                            nvEncoder.Initialize(device, (uint)fw, (uint)fh);
+                        nvEncoder.EncodeFrame(texture, (uint)fw, (uint)fh);
+                    };
+                    Msg($"[RemoteStream] This panel drives the encoder for stream {shared.StreamId}");
+                }
+                else
+                {
+                    Msg($"[RemoteStream] This panel shares encoder from stream {shared.StreamId}, no encoding hook");
+                }
+
+                // VideoTextureProvider on its own always-active slot (must stay active to load the stream)
+                var videoSlot = root.AddSlot("StreamProvider");
+                var videoTex = videoSlot.AttachComponent<VideoTextureProvider>();
+                videoTex.URL.Value = shared.StreamUrl;
+                videoTex.Stream.Value = true;
+                videoTex.Volume.Value = 0f;
+                videoTexRef = videoTex;
+
+                // Visual display on a separate slot with per-user visibility
+                var streamSlot = root.AddSlot("RemoteStreamVisual");
                 streamSlot.LocalScale = float3.One * canvasScale;
-                streamSlotRef = streamSlot; // For Test Stream button
+                streamSlotRef = streamSlot;
 
-                // Per-user visibility: stream visible to others, hidden from spawner
+                // Per-user visibility on the VISUAL only — VideoTextureProvider stays active
                 var streamVis = streamSlot.AttachComponent<ValueUserOverride<bool>>();
                 streamVis.Target.Target = streamSlot.ActiveSelf_Field;
                 streamVis.Default.Value = true; // Other users: visible
                 streamVis.CreateOverrideOnWrite.Value = false;
                 streamVis.SetOverride(root.World.LocalUser, false); // Spawner: hidden
                 streamVisRef = streamVis;
-                Msg("[RemoteStream] Per-user visibility set (local=false, others=true)");
+                Msg("[RemoteStream] Per-user visibility on visual (local=false, others=true)");
 
                 var streamCanvas = streamSlot.AttachComponent<Canvas>();
                 streamCanvas.Size.Value = new float2(w, h);
                 var streamUi = new UIBuilder(streamCanvas);
-
-                var videoTex = streamSlot.AttachComponent<VideoTextureProvider>();
-                videoTex.URL.Value = streamUrl;
-                videoTex.Stream.Value = true;
-                videoTex.Volume.Value = 0f;
 
                 var streamImg = streamUi.RawImage(videoTex);
                 var streamMat = streamSlot.AttachComponent<UI_UnlitMaterial>();
                 streamMat.BlendMode.Value = BlendMode.Opaque;
                 streamImg.Material.Target = streamMat;
 
-                Msg($"[RemoteStream] Created behind local display, URL={streamUrl}, session={sessionIdx}");
+                Msg($"[RemoteStream] Created, URL={shared.StreamUrl}, streamId={shared.StreamId}, refs={shared.RefCount}");
 
                 // Monitor state
                 int checkCount = 0;
@@ -669,6 +752,37 @@ public class DesktopBuddyMod : ResoniteMod
 
     private static readonly Stopwatch _perfSw = new();
 
+    private static void CleanupSession(DesktopSession session)
+    {
+        session.Streamer?.Dispose();
+        if (session.Canvas != null) DesktopCanvasIds.Remove(session.Canvas.ReferenceID);
+
+        // Shared stream ref counting — only stop encoder when last panel is removed
+        if (session.StreamId > 0)
+        {
+            lock (_sharedStreams)
+            {
+                if (_sharedStreams.TryGetValue(session.Hwnd, out var shared) && shared.StreamId == session.StreamId)
+                {
+                    shared.RefCount--;
+                    Msg($"[Cleanup] Stream {shared.StreamId} refs now {shared.RefCount}");
+                    if (shared.RefCount <= 0)
+                    {
+                        _sharedStreams.Remove(session.Hwnd);
+                        StreamServer?.StopEncoder(session.StreamId);
+                        Msg($"[Cleanup] Last ref removed, encoder {session.StreamId} stopped");
+                    }
+                }
+                else
+                {
+                    // Orphaned stream (hwnd mismatch or already removed) — stop directly
+                    StreamServer?.StopEncoder(session.StreamId);
+                    Msg($"[Cleanup] Orphaned stream {session.StreamId} stopped");
+                }
+            }
+        }
+    }
+
     private static void UpdateLoop(World world)
     {
         _updateCount++;
@@ -691,9 +805,7 @@ public class DesktopBuddyMod : ResoniteMod
                     session.Texture == null || session.Texture.IsDestroyed)
                 {
                     Msg($"[UpdateLoop] Session {i} root/texture destroyed, cleaning up");
-                    session.Streamer?.Dispose();
-
-                    if (session.Canvas != null) DesktopCanvasIds.Remove(session.Canvas.ReferenceID);
+                    CleanupSession(session);
                     ActiveSessions.RemoveAt(i);
                     continue;
                 }
@@ -705,9 +817,7 @@ public class DesktopBuddyMod : ResoniteMod
                 if (!session.Streamer.IsValid)
                 {
                     Msg($"[UpdateLoop] Window closed (IsValid=false), destroying viewer");
-                    session.Streamer.Dispose();
-
-                    if (session.Canvas != null) DesktopCanvasIds.Remove(session.Canvas.ReferenceID);
+                    CleanupSession(session);
                     session.Root.Destroy();
                     ActiveSessions.RemoveAt(i);
                     continue;
@@ -764,16 +874,6 @@ public class DesktopBuddyMod : ResoniteMod
 
                 _setFromBitmapMethod?.Invoke(session.Texture, _uploadArgs);
 
-                // Share frame with stream encoder (just set reference + signal, no copy, no blocking)
-                lock (session.StreamLock)
-                {
-                    session.StreamFrame = frame;
-                    session.StreamWidth = w;
-                    session.StreamHeight = h;
-                    session.StreamFrameReady = true;
-                    System.Threading.Monitor.PulseAll(session.StreamLock);
-                }
-
                 _perfSw.Stop();
                 if (_updateCount <= 5 || _updateCount % 300 == 0)
                 {
@@ -806,7 +906,14 @@ public class DesktopBuddyMod : ResoniteMod
         try
         {
             // Check if cloudflared is available
-            string[] candidates = { "cloudflared", @"C:\bins\cloudflared.exe", @"C:\Program Files (x86)\cloudflared\cloudflared.exe" };
+            var modDir = System.IO.Path.GetDirectoryName(typeof(DesktopBuddyMod).Assembly.Location) ?? "";
+            string[] candidates = {
+                System.IO.Path.Combine(modDir, "..", "cloudflared", "cloudflared.exe"), // rml_mods/../cloudflared/
+                System.IO.Path.Combine(modDir, "cloudflared", "cloudflared.exe"),
+                System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "cloudflared", "cloudflared.exe"),
+                @"C:\Program Files (x86)\cloudflared\cloudflared.exe",
+                "cloudflared" // PATH
+            };
             string cfPath = null;
             foreach (var c in candidates)
             {
@@ -854,9 +961,10 @@ public class DesktopBuddyMod : ResoniteMod
                 {
                     int idx = e.Data.IndexOf("https://");
                     string url = e.Data.Substring(idx).Trim();
-                    // Clean up any trailing text
                     int space = url.IndexOf(' ');
                     if (space > 0) url = url.Substring(0, space);
+                    // Always strip to origin — cloudflared logs proxied request URLs with paths
+                    try { url = new Uri(url).GetLeftPart(UriPartial.Authority); } catch { }
                     TunnelUrl = url;
                     Msg($"[Tunnel] PUBLIC URL: {TunnelUrl}");
                 }
@@ -866,6 +974,61 @@ public class DesktopBuddyMod : ResoniteMod
         catch (Exception ex)
         {
             Msg($"[Tunnel] Error: {ex.Message}");
+        }
+    }
+
+    // Max frame size for pipe throughput: ~4MB/frame works at realtime
+    // 1280x720x4 = 3.6MB — tested at 1.8x realtime
+    private const int STREAM_MAX_W = 1280;
+    private const int STREAM_MAX_H = 720;
+
+    private static void DownscaleAndShareFrame(DesktopSession session, byte[] frame, int w, int h)
+    {
+        int dstW = w, dstH = h;
+        bool needsScale = w > STREAM_MAX_W || h > STREAM_MAX_H;
+        if (needsScale)
+        {
+            float scale = Math.Min((float)STREAM_MAX_W / w, (float)STREAM_MAX_H / h);
+            dstW = ((int)(w * scale)) & ~1;
+            dstH = ((int)(h * scale)) & ~1;
+        }
+
+        lock (session.StreamLock)
+        {
+            if (!needsScale)
+            {
+                // Pass through — no copy, FFmpeg handles vflip
+                session.StreamFrame = frame;
+            }
+            else
+            {
+                // Bilinear-ish downscale (2x2 box average for better quality than nearest-neighbor)
+                if (session.ScaledBuffer == null || session.ScaledBuffer.Length != dstW * dstH * 4)
+                    session.ScaledBuffer = new byte[dstW * dstH * 4];
+
+                unsafe
+                {
+                    fixed (byte* srcPtr = frame, dstPtr = session.ScaledBuffer)
+                    {
+                        uint* src = (uint*)srcPtr;
+                        uint* dst = (uint*)dstPtr;
+                        for (int y = 0; y < dstH; y++)
+                        {
+                            int srcY = y * h / dstH;
+                            for (int x = 0; x < dstW; x++)
+                            {
+                                int srcX = x * w / dstW;
+                                dst[y * dstW + x] = src[srcY * w + srcX];
+                            }
+                        }
+                    }
+                }
+                session.StreamFrame = session.ScaledBuffer;
+            }
+            session.StreamWidth = dstW;
+            session.StreamHeight = dstH;
+            session.StreamFrameReady = true;
+            System.Threading.Monitor.PulseAll(session.StreamLock);
         }
     }
 
@@ -1028,7 +1191,7 @@ static class TypeAppendPatch
     }
 }
 
-internal class DesktopSession
+public class DesktopSession
 {
     public DesktopStreamer Streamer;
     public SolidColorTexture Texture;
@@ -1048,6 +1211,13 @@ internal class DesktopSession
 
     // One-shot diagnostic flag for joystick detection
     public bool JoystickDiagLogged;
+
+    // Unique stream ID (never reused, never shifts)
+    public int StreamId;
+    public IntPtr Hwnd; // For shared stream cleanup
+
+    // Downscaled frame buffer for stream encoding
+    public byte[] ScaledBuffer;
 
     // Stream: shared frame for FFmpeg encoding (set by update loop, read by encoder thread)
     public volatile byte[] StreamFrame;

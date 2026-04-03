@@ -107,6 +107,12 @@ public sealed class WgcCapture : IDisposable
     private const int D3D11_USAGE_STAGING = 3;
     private const uint D3D11_CPU_ACCESS_READ = 0x20000;
 
+    /// <summary>
+    /// Called with (d3dDevice, srcTexture, width, height) for each captured frame.
+    /// Runs on WGC background thread. Texture only valid during callback.
+    /// </summary>
+    public Action<IntPtr, IntPtr, int, int> OnGpuFrame;
+
     private IntPtr _hwnd;
     private bool _isDesktop;
     private IDirect3DDevice _winrtDevice;
@@ -117,10 +123,13 @@ public sealed class WgcCapture : IDisposable
     private GraphicsCaptureSession _session;
 
     private IntPtr _stagingTexture;
+    private IntPtr _encodeTexture; // Persistent GPU texture for NVENC encoding + keepalive
+    private int _encodeTexW, _encodeTexH;
     private byte[] _buffer;
     private GCHandle _pinnedBuffer;
     private readonly object _frameLock = new();
     private volatile bool _frameReady;
+    private Thread _keepaliveThread;
     private volatile bool _closed;
     private int _lastWidth, _lastHeight;
     private int _framesCaptured;
@@ -317,6 +326,16 @@ public sealed class WgcCapture : IDisposable
 
         try
         {
+            // Copy to persistent encode texture (for NVENC + keepalive re-encoding)
+            Interlocked.Exchange(ref _lastFrameTicks, DateTime.UtcNow.Ticks);
+            EnsureEncodeTexture(w, h);
+            ContextCopyResource(_d3dContext, _encodeTexture, srcTexture);
+
+            // GPU encode callback — NVENC encodes from the persistent copy
+            try { OnGpuFrame?.Invoke(_d3dDevice, _encodeTexture, w, h); }
+            catch (Exception gpuEx) { ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] OnGpuFrame error: {gpuEx}"); }
+
+            // Copy to staging for CPU readback (local preview)
             EnsureStagingTexture(w, h);
             if (_frameLog <= 5) ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] CopyResource staging={_stagingTexture}");
             ContextCopyResource(_d3dContext, _stagingTexture, srcTexture);
@@ -396,6 +415,49 @@ public sealed class WgcCapture : IDisposable
         }
     }
 
+    private void EnsureEncodeTexture(int w, int h)
+    {
+        if (_encodeTexture != IntPtr.Zero && w == _encodeTexW && h == _encodeTexH) return;
+        if (_encodeTexture != IntPtr.Zero) { Marshal.Release(_encodeTexture); _encodeTexture = IntPtr.Zero; }
+
+        var desc = new D3D11_TEXTURE2D_DESC
+        {
+            Width = (uint)w, Height = (uint)h,
+            MipLevels = 1, ArraySize = 1,
+            Format = DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleCount = 1, SampleQuality = 0,
+            Usage = 0, // D3D11_USAGE_DEFAULT — GPU read/write
+            BindFlags = 0,
+            CPUAccessFlags = 0,
+            MiscFlags = 0
+        };
+        DeviceCreateTexture2D(_d3dDevice, ref desc, IntPtr.Zero, out _encodeTexture);
+        _encodeTexW = w; _encodeTexH = h;
+
+        // Start keepalive thread if not already running
+        if (_keepaliveThread == null)
+        {
+            _keepaliveThread = new Thread(() =>
+            {
+                while (!_disposed)
+                {
+                    Thread.Sleep(100); // 10fps keepalive
+                    if (_disposed || OnGpuFrame == null || _encodeTexture == IntPtr.Zero) continue;
+                    // Only send keepalive if WGC hasn't fired recently
+                    long msSinceFrame = (DateTime.UtcNow.Ticks - Interlocked.Read(ref _lastFrameTicks)) / TimeSpan.TicksPerMillisecond;
+                    if (msSinceFrame > 150) // 150ms idle = send keepalive
+                    {
+                        try { OnGpuFrame.Invoke(_d3dDevice, _encodeTexture, _encodeTexW, _encodeTexH); }
+                        catch (Exception kaEx) { ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] Keepalive error: {kaEx.Message}"); }
+                    }
+                }
+            }) { IsBackground = true, Name = "WGC_Keepalive" };
+            _keepaliveThread.Start();
+        }
+    }
+
+    private long _lastFrameTicks;
+
     private void EnsureStagingTexture(int w, int h)
     {
         if (_stagingTexture != IntPtr.Zero)
@@ -472,6 +534,7 @@ public sealed class WgcCapture : IDisposable
         try { _framePool?.Dispose(); } catch { }
         _item = null;
 
+        if (_encodeTexture != IntPtr.Zero) { Marshal.Release(_encodeTexture); _encodeTexture = IntPtr.Zero; }
         if (_stagingTexture != IntPtr.Zero) { Marshal.Release(_stagingTexture); _stagingTexture = IntPtr.Zero; }
         if (_d3dContext != IntPtr.Zero) { Marshal.Release(_d3dContext); _d3dContext = IntPtr.Zero; }
         if (_d3dDevice != IntPtr.Zero) { Marshal.Release(_d3dDevice); _d3dDevice = IntPtr.Zero; }

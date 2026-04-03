@@ -5,10 +5,18 @@ Resonite mod that spawns a world-space desktop/window viewer with touch input. U
 
 ## Build & Deploy
 ```
-dotnet build DesktopBuddy/DesktopBuddy.csproj
-# Copy to: C:\Program Files (x86)\Steam\steamapps\common\Resonite\rml_mods\
+npm run build          # Build only (auto-copies to rml_mods if Resonite not running)
+npm run package        # Build + zip DesktopBuddy_Install.zip with all deps (ffmpeg, cloudflared)
 # Kill Resonite first if DLL locked: taskkill /F /IM Renderite.Host.exe
 ```
+
+### Distribution
+`npm run package` creates `DesktopBuddy_Install.zip` — extract into Resonite root:
+- `rml_mods/` — mod DLLs (DesktopBuddy, NvEncSharp, WinRT, Windows SDK)
+- `ffmpeg/` — ffmpeg.exe + shared libs (for MPEG-TS muxing)
+- `cloudflared/` — cloudflared.exe (for tunnel to remote users)
+
+Prerequisites: ResoniteModLoader installed, NVIDIA GPU (NVENC), Windows 10+.
 
 ## Architecture
 - No custom components (engine doesn't support mod component types properly)
@@ -37,6 +45,10 @@ This applies equally to new code and edits to existing code. A wrong assumption 
 - State transitions (source claimed, mode changed, etc.)
 
 Never write a code path without a log statement. If it runs, we need to know it ran.
+
+**NEVER swallow exceptions with empty `catch { }`.** Every catch block MUST log the full exception with `Msg($"[Context] error: {ex}")`. No exceptions. No excuses. If something fails silently, it's impossible to debug.
+
+**NEVER commit for the user.** Only the user decides when to commit. Never run `git commit` or `git push` without being explicitly asked.
 
 ## Source Files
 - `DesktopBuddyMod.cs` — Main mod, streaming setup, update loop, VR input handling

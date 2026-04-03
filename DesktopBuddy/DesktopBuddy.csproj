@@ -17,6 +17,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\NvEncSharp\src\NvEncSharp\NvEncSharp.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Reference Include="FrooxEngine">
       <HintPath>$(ResonitePath)\FrooxEngine.dll</HintPath>
       <Private>false</Private>
@@ -55,11 +59,12 @@
     </Reference>
   </ItemGroup>
 
-  <!-- Copy to rml_mods after build -->
+  <!-- Copy to rml_mods after build (ContinueOnError so build succeeds even if Resonite is running) -->
   <Target Name="CopyToResonite" AfterTargets="Build">
-    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(ResonitePath)\rml_mods" />
-    <Copy SourceFiles="$(TargetDir)Microsoft.Windows.SDK.NET.dll" DestinationFolder="$(ResonitePath)\rml_mods" />
-    <Copy SourceFiles="$(TargetDir)WinRT.Runtime.dll" DestinationFolder="$(ResonitePath)\rml_mods" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(ResonitePath)\rml_mods" ContinueOnError="true" />
+    <Copy SourceFiles="$(TargetDir)Microsoft.Windows.SDK.NET.dll" DestinationFolder="$(ResonitePath)\rml_mods" ContinueOnError="true" />
+    <Copy SourceFiles="$(TargetDir)WinRT.Runtime.dll" DestinationFolder="$(ResonitePath)\rml_mods" ContinueOnError="true" />
+    <Copy SourceFiles="$(TargetDir)NvEncSharp.dll" DestinationFolder="$(ResonitePath)\rml_mods" ContinueOnError="true" />
   </Target>
 
 </Project>

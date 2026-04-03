@@ -1,0 +1,9 @@
+{
+  "name": "desktop-buddy",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "dotnet build DesktopBuddy/DesktopBuddy.csproj",
+    "package": "dotnet build DesktopBuddy/DesktopBuddy.csproj && node scripts/package.js"
+  }
+}
