@@ -58,17 +58,16 @@ public sealed unsafe class FfmpegEncoder : IDisposable
     private volatile bool _disposed;
     private int _disposeGuard; // Interlocked guard for idempotent Dispose
     private readonly AutoResetEvent _frameSignal = new(false);
-    private volatile IntPtr _pendingTexture; // Set by WGC callback, consumed by encode thread (NVENC)
+    private volatile IntPtr _pendingTexture; // Set by WGC callback, consumed by encode thread
     private volatile uint _pendingWidth, _pendingHeight;
-    private volatile byte[] _pendingCpuFrame; // Set by WGC readback, consumed by encode thread (AMF)
     private IntPtr _deviceContext; // FFmpeg's D3D11 device context for encode thread
     private object _d3dContextLock; // Shared lock with WgcCapture to serialize D3D11 immediate context access
-    private bool _needsColorConvert; // AMF: BGRA source needs conversion to NV12
-    private IntPtr _stagingTex;      // Staging texture for CPU readback (AMF path)
-    private SwsContext* _swsColorCtx; // BGRA→NV12 converter (AMF path)
-    private AVFrame* _cpuFrame;       // CPU-side NV12 frame for upload (AMF path)
-    private IntPtr _lastTexture; // Last encoded texture for keepalive re-encode (NVENC)
-    private byte[] _lastCpuFrame; // Last CPU frame for keepalive re-encode (AMF)
+    private IntPtr _lastTexture; // Last encoded texture for keepalive re-encode
+
+    // D3D11 Video Processor for BGRA→NV12 conversion (AMF path)
+    private bool _needsVideoProcessor;
+    private IntPtr _vpDevice, _vpContext, _vpEnum, _vpProcessor;
+    private IntPtr _vpInputView, _vpOutputView, _vpNv12Texture;
     private uint _lastWidth, _lastHeight;
     private long _startTicks;
     private long _lastVideoPts = -1; // Ensure monotonic pts
@@ -200,10 +199,11 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             _width = width & ~1u;
             _height = height & ~1u;
 
-            // GPU encoders have minimum dimension requirements (NVENC: 32px, AMF: 64px)
-            if (_width < 64 || _height < 64)
+            // GPU encoders have minimum dimension requirements. AMF crashes internally (AVERROR_BUG)
+            // on dimensions below ~128px. Use 128 as minimum for all encoders.
+            if (_width < 128 || _height < 128)
             {
-                ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Window too small for encoding: {_width}x{_height} (min 64x64)");
+                ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Window too small for encoding: {_width}x{_height} (min 128x128)");
                 _initFailed = true; return false;
             }
 
@@ -253,7 +253,6 @@ public sealed unsafe class FfmpegEncoder : IDisposable
                 var swFormat = name.Contains("amf")
                     ? AVPixelFormat.AV_PIX_FMT_NV12
                     : AVPixelFormat.AV_PIX_FMT_BGRA;
-                _needsColorConvert = name.Contains("amf");
                 SetupHardwareContext(d3dDevice, swFormat);
 
                 AVDictionary* opts = null;
@@ -279,7 +278,7 @@ public sealed unsafe class FfmpegEncoder : IDisposable
                 }
                 ffmpeg.av_dict_free(&opts);
 
-                if (ret >= 0) { codecName = name; break; }
+                if (ret >= 0) { codecName = name; _needsVideoProcessor = name.Contains("amf"); break; }
                 ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] {name} failed: {FfmpegError(ret)}");
             }
 
@@ -297,26 +296,6 @@ public sealed unsafe class FfmpegEncoder : IDisposable
 
             ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Codec opened: {codecName}");
 
-            // AMF needs BGRA→NV12 conversion: create staging texture, sws converter, and CPU frame
-            if (_needsColorConvert)
-            {
-                // Create staging texture for CPU readback of the BGRA source
-                _stagingTex = CreateStagingTexture(d3dDevice, _width, _height);
-                ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Created staging texture {_width}x{_height} BGRA for AMF color conversion (raw input will be {width}x{height})");
-
-                // WgcCapture's compute shader converts BGRA→RGBA, so input is RGBA
-                _swsColorCtx = ffmpeg.sws_getContext(
-                    (int)_width, (int)_height, AVPixelFormat.AV_PIX_FMT_RGBA,
-                    (int)_width, (int)_height, AVPixelFormat.AV_PIX_FMT_NV12,
-                    ffmpeg.SWS_FAST_BILINEAR, null, null, null);
-
-                _cpuFrame = ffmpeg.av_frame_alloc();
-                _cpuFrame->format = (int)AVPixelFormat.AV_PIX_FMT_NV12;
-                _cpuFrame->width = (int)_width;
-                _cpuFrame->height = (int)_height;
-                ffmpeg.av_frame_get_buffer(_cpuFrame, 0);
-            }
-
             // Allocate frame and packet
             _hwFrame = ffmpeg.av_frame_alloc();
             _pkt = ffmpeg.av_packet_alloc();
@@ -333,6 +312,10 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             var hwDevCtxData = (AVHWDeviceContext*)_hwDeviceCtx->data;
             var d3d11DevCtxData = (AVD3D11VADeviceContext*)hwDevCtxData->hwctx;
             _deviceContext = (IntPtr)d3d11DevCtxData->device_context;
+
+            // AMF: set up D3D11 Video Processor for BGRA→NV12 conversion (needs _deviceContext)
+            if (_needsVideoProcessor)
+                SetupVideoProcessor(d3dDevice, _width, _height);
 
             _ringBuffer = new byte[RING_SIZE];
             _ringWritePos = 0;
@@ -512,22 +495,6 @@ public sealed unsafe class FfmpegEncoder : IDisposable
         return buf_size;
     }
 
-    /// <summary>Whether this encoder needs CPU pixel data instead of GPU textures (AMF path).</summary>
-    public bool NeedsCpuFrames => _needsColorConvert;
-
-    /// <summary>
-    /// Queue CPU pixel data (RGBA, row-major, no padding) for encoding. AMF path only.
-    /// </summary>
-    public void EncodeCpuFrame(byte[] rgbaData, uint width, uint height)
-    {
-        if (_disposed || _initFailed || !_initialized) return;
-        if ((width & ~1u) != _width || (height & ~1u) != _height) return;
-        _pendingCpuFrame = rgbaData;
-        _pendingWidth = width;
-        _pendingHeight = height;
-        _frameSignal.Set();
-    }
-
     /// <summary>
     /// Queue a D3D11 texture for encoding. Returns immediately — encoding happens on background thread.
     /// The texture must be persistent (not released after this call). NVENC path.
@@ -566,27 +533,13 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             if ((now - lastEncodeTicks) < frameInterval)
                 continue;
 
-            // AMF path: CPU frames; NVENC path: GPU textures
-            byte[] cpuFrame = _pendingCpuFrame;
             IntPtr texture = _pendingTexture;
-
-            if (cpuFrame != null)
-            {
-                _pendingCpuFrame = null;
-                _lastCpuFrame = cpuFrame;
-                _lastWidth = _pendingWidth;
-                _lastHeight = _pendingHeight;
-            }
-            else if (texture != IntPtr.Zero)
+            if (texture != IntPtr.Zero)
             {
                 _pendingTexture = IntPtr.Zero;
                 _lastTexture = texture;
                 _lastWidth = _pendingWidth;
                 _lastHeight = _pendingHeight;
-            }
-            else if (_lastCpuFrame != null)
-            {
-                cpuFrame = _lastCpuFrame;
             }
             else if (_lastTexture != IntPtr.Zero)
             {
@@ -598,13 +551,10 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             }
             lastEncodeTicks = now;
 
-            if (_disposed) break; // re-check before expensive FFmpeg call
+            if (_disposed) break;
             try
             {
-                if (cpuFrame != null)
-                    EncodeCpuFrameInternal(cpuFrame, _lastWidth, _lastHeight);
-                else
-                    EncodeFrameInternal(texture, _lastWidth, _lastHeight);
+                EncodeFrameInternal(texture, _lastWidth, _lastHeight);
             }
             catch (Exception ex)
             {
@@ -614,91 +564,34 @@ public sealed unsafe class FfmpegEncoder : IDisposable
         ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Encode thread ended");
     }
 
-    /// <summary>AMF path: RGBA CPU data → sws RGBA→NV12 → upload to NV12 hw frame → encode.</summary>
-    private void EncodeCpuFrameInternal(byte[] rgbaData, uint width, uint height)
-    {
-        int ret;
-
-        // Convert RGBA → NV12
-        ffmpeg.av_frame_make_writable(_cpuFrame);
-        fixed (byte* src = rgbaData)
-        {
-            var srcData = new byte_ptrArray8();
-            var srcLinesize = new int_array8();
-            srcData[0] = src;
-            srcLinesize[0] = (int)_width * 4; // RGBA stride, no padding (WgcCapture memcpy'd without pitch)
-            ffmpeg.sws_scale(_swsColorCtx, srcData, srcLinesize, 0, (int)_height, _cpuFrame->data, _cpuFrame->linesize);
-        }
-
-        // Upload NV12 CPU frame to GPU hw frame
-        lock (_d3dContextLock)
-        {
-            ret = ffmpeg.av_hwframe_get_buffer(_hwFramesCtx, _hwFrame, 0);
-            if (ret < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] av_hwframe_get_buffer failed: {FfmpegError(ret)}"); return; }
-
-            ret = ffmpeg.av_hwframe_transfer_data(_hwFrame, _cpuFrame, 0);
-            if (ret < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] av_hwframe_transfer_data failed: {FfmpegError(ret)}"); return; }
-        }
-
-        // PTS + encode + mux (same as GPU path)
-        double elapsedSec = (double)(System.Diagnostics.Stopwatch.GetTimestamp() - _startTicks) / System.Diagnostics.Stopwatch.Frequency;
-        long videoPts = (long)(elapsedSec * _fps);
-        if (videoPts <= _lastVideoPts) videoPts = _lastVideoPts + 1;
-        _lastVideoPts = videoPts;
-        _hwFrame->pts = videoPts;
-        _hwFrame->width = (int)_width;
-        _hwFrame->height = (int)_height;
-
-        using (DesktopBuddyMod.Perf.Time("ffmpeg_encode"))
-        {
-            ret = ffmpeg.avcodec_send_frame(_codecCtx, _hwFrame);
-            ffmpeg.av_frame_unref(_hwFrame);
-            if (ret < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] avcodec_send_frame failed: {FfmpegError(ret)}"); return; }
-        }
-
-        using (DesktopBuddyMod.Perf.Time("ffmpeg_mux"))
-        {
-            while (true)
-            {
-                ret = ffmpeg.avcodec_receive_packet(_codecCtx, _pkt);
-                if (ret == ffmpeg.AVERROR(ffmpeg.EAGAIN) || ret == ffmpeg.AVERROR_EOF) break;
-                if (ret < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] avcodec_receive_packet failed: {FfmpegError(ret)}"); break; }
-                _pkt->stream_index = _stream->index;
-                ffmpeg.av_packet_rescale_ts(_pkt, _codecCtx->time_base, _stream->time_base);
-                ret = ffmpeg.av_write_frame(_fmtCtx, _pkt);
-                if (ret < 0) ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] av_write_frame failed: {FfmpegError(ret)}");
-                ffmpeg.av_packet_unref(_pkt);
-            }
-        }
-
-        if (_audioCodecCtx != null && _audioCapture != null)
-        {
-            using (DesktopBuddyMod.Perf.Time("ffmpeg_audio"))
-                EncodeAudio();
-        }
-
-        ffmpeg.avio_flush(_fmtCtx->pb);
-        _totalFrames++;
-        if (_totalFrames <= 5 || _totalFrames % 300 == 0)
-            ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Frame #{_totalFrames} ({width}x{height}), ringPos={_ringWritePos}");
-    }
-
-    /// <summary>NVENC path: D3D11 texture → direct copy to hw frame → encode.</summary>
+    /// <summary>D3D11 texture → copy to hw frame → encode.</summary>
     private void EncodeFrameInternal(IntPtr srcTexture, uint width, uint height)
     {
         int ret;
         AVFrame* frameToEncode;
 
+        lock (_d3dContextLock)
         {
-            // NVENC path: direct BGRA texture copy (same format, no conversion needed)
-            lock (_d3dContextLock)
+            using (DesktopBuddyMod.Perf.Time("ffmpeg_get_buffer"))
             {
-                using (DesktopBuddyMod.Perf.Time("ffmpeg_get_buffer"))
-                {
-                    ret = ffmpeg.av_hwframe_get_buffer(_hwFramesCtx, _hwFrame, 0);
-                    if (ret < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] av_hwframe_get_buffer failed: {FfmpegError(ret)}"); return; }
-                }
+                ret = ffmpeg.av_hwframe_get_buffer(_hwFramesCtx, _hwFrame, 0);
+                if (ret < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] av_hwframe_get_buffer failed: {FfmpegError(ret)}"); return; }
+            }
 
+            if (_needsVideoProcessor)
+            {
+                // AMF: convert BGRA source → NV12 via D3D11 Video Processor, then copy NV12 to hw frame
+                using (DesktopBuddyMod.Perf.Time("ffmpeg_tex_copy"))
+                {
+                    VideoProcessorConvert(srcTexture);
+                    IntPtr dstTexture = (IntPtr)_hwFrame->data[0];
+                    int dstIndex = (int)_hwFrame->data[1];
+                    CopyTextureToFrame(_deviceContext, dstTexture, dstIndex, _vpNv12Texture, (int)_width, (int)_height);
+                }
+            }
+            else
+            {
+                // NVENC: direct BGRA copy (hw frame is BGRA, same format as source)
                 using (DesktopBuddyMod.Perf.Time("ffmpeg_tex_copy"))
                 {
                     IntPtr dstTexture = (IntPtr)_hwFrame->data[0];
@@ -706,8 +599,8 @@ public sealed unsafe class FfmpegEncoder : IDisposable
                     CopyTextureToFrame(_deviceContext, dstTexture, dstIndex, srcTexture, (int)_width, (int)_height);
                 }
             }
-            frameToEncode = _hwFrame;
         }
+        frameToEncode = _hwFrame;
 
         // Wall clock pts — monotonically increasing, never duplicate
         double elapsedSec = (double)(System.Diagnostics.Stopwatch.GetTimestamp() - _startTicks) / System.Diagnostics.Stopwatch.Frequency;
@@ -838,14 +731,43 @@ public sealed unsafe class FfmpegEncoder : IDisposable
         fn(deviceContext, dstTexture, (uint)dstArrayIndex, 0, 0, 0, srcTexture, 0, box);
     }
 
-    // D3D11 helpers for AMF color conversion path
-    private const int ID3D11Device_CreateTexture2D = 5;
-    private const int ID3D11DeviceContext_Map = 14;
-    private const int ID3D11DeviceContext_Unmap = 15;
-    private const int ID3D11DeviceContext_CopyResource = 47;
+    // --- D3D11 Video Processor for BGRA→NV12 conversion (AMF) ---
 
-    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    private struct D3D11_TEX2D_DESC
+    private static readonly Guid IID_ID3D11VideoDevice = new(0x10EC4D5B, 0x975A, 0x4689, 0xB9, 0xE4, 0xD0, 0xAA, 0xC3, 0x0F, 0xE3, 0x33);
+    private static readonly Guid IID_ID3D11VideoContext = new(0x61F21C45, 0x3C0E, 0x4A74, 0x9C, 0xEA, 0x67, 0x10, 0x0D, 0x9A, 0xD5, 0xE4);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct VP_CONTENT_DESC
+    {
+        public int InputFrameFormat;
+        public uint InputFrameRateNum, InputFrameRateDen;
+        public uint InputWidth, InputHeight;
+        public uint OutputFrameRateNum, OutputFrameRateDen;
+        public uint OutputWidth, OutputHeight;
+        public int Usage;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct VP_INPUT_VIEW_DESC { public uint FourCC; public int ViewDimension; public uint MipSlice, ArraySlice; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct VP_OUTPUT_VIEW_DESC { public int ViewDimension; public uint MipSlice, FirstArraySlice, ArraySize; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct VP_STREAM
+    {
+        public int Enable;
+        public uint OutputIndex, InputFrameOrField, PastFrames, FutureFrames;
+        private uint _pad; // align pointers to 8 bytes on x64
+        public IntPtr ppPastSurfaces, pInputSurface, ppFutureSurfaces;
+        public IntPtr ppPastSurfacesRight, pInputSurfaceRight, ppFutureSurfacesRight;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct VP_COLOR_SPACE { public uint Value; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TEX2D_DESC
     {
         public uint Width, Height, MipLevels, ArraySize;
         public int Format;
@@ -854,29 +776,101 @@ public sealed unsafe class FfmpegEncoder : IDisposable
         public uint BindFlags, CPUAccessFlags, MiscFlags;
     }
 
-    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    private struct D3D11_MAPPED
+    private void SetupVideoProcessor(IntPtr d3dDevice, uint w, uint h)
     {
-        public IntPtr pData;
-        public uint RowPitch, DepthPitch;
-    }
+        int hr;
+        var iidVD = IID_ID3D11VideoDevice;
+        var iidVC = IID_ID3D11VideoContext;
 
-    private static IntPtr CreateStagingTexture(IntPtr device, uint w, uint h)
-    {
-        var desc = new D3D11_TEX2D_DESC
+        // Get video interfaces
+        hr = Marshal.QueryInterface(d3dDevice, ref iidVD, out _vpDevice);
+        if (hr < 0) throw new Exception($"QueryInterface ID3D11VideoDevice failed hr=0x{hr:X8}");
+
+        hr = Marshal.QueryInterface(_deviceContext, ref iidVC, out _vpContext);
+        if (hr < 0) throw new Exception($"QueryInterface ID3D11VideoContext failed hr=0x{hr:X8}");
+
+        // Create enumerator
+        var desc = new VP_CONTENT_DESC
+        {
+            InputFrameFormat = 0, // Progressive
+            InputFrameRateNum = 30, InputFrameRateDen = 1,
+            InputWidth = w, InputHeight = h,
+            OutputFrameRateNum = 30, OutputFrameRateDen = 1,
+            OutputWidth = w, OutputHeight = h,
+            Usage = 1 // OptimalSpeed
+        };
+        var vpDevVt = *(IntPtr**)_vpDevice;
+        var createEnumFn = (delegate* unmanaged[Stdcall]<IntPtr, VP_CONTENT_DESC*, out IntPtr, int>)vpDevVt[10];
+        hr = createEnumFn(_vpDevice, &desc, out _vpEnum);
+        if (hr < 0) throw new Exception($"CreateVideoProcessorEnumerator failed hr=0x{hr:X8}");
+
+        // Create processor
+        var createProcFn = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, uint, out IntPtr, int>)vpDevVt[4];
+        hr = createProcFn(_vpDevice, _vpEnum, 0, out _vpProcessor);
+        if (hr < 0) throw new Exception($"CreateVideoProcessor failed hr=0x{hr:X8}");
+
+        // Create NV12 output texture (needs RENDER_TARGET bind flag for VP output)
+        var nv12Desc = new TEX2D_DESC
         {
             Width = w, Height = h, MipLevels = 1, ArraySize = 1,
-            Format = 87, // DXGI_FORMAT_B8G8R8A8_UNORM
+            Format = 103, // DXGI_FORMAT_NV12
             SampleCount = 1, SampleQuality = 0,
-            Usage = 3, // D3D11_USAGE_STAGING
-            BindFlags = 0, CPUAccessFlags = 0x20000, // D3D11_CPU_ACCESS_READ
-            MiscFlags = 0
+            Usage = 0, // D3D11_USAGE_DEFAULT
+            BindFlags = 0x20, // D3D11_BIND_RENDER_TARGET
+            CPUAccessFlags = 0, MiscFlags = 0
         };
-        var vtable = *(IntPtr**)device;
-        var fn = (delegate* unmanaged[Stdcall]<IntPtr, D3D11_TEX2D_DESC*, IntPtr, out IntPtr, int>)vtable[ID3D11Device_CreateTexture2D];
-        int hr = fn(device, &desc, IntPtr.Zero, out IntPtr tex);
-        if (hr < 0) throw new System.Exception($"CreateStagingTexture failed hr=0x{hr:X8}");
-        return tex;
+        var devVt = *(IntPtr**)d3dDevice;
+        var createTexFn = (delegate* unmanaged[Stdcall]<IntPtr, TEX2D_DESC*, IntPtr, out IntPtr, int>)devVt[5]; // CreateTexture2D
+        hr = createTexFn(d3dDevice, &nv12Desc, IntPtr.Zero, out _vpNv12Texture);
+        if (hr < 0) throw new Exception($"CreateTexture2D NV12 failed hr=0x{hr:X8}");
+
+        // Create output view for NV12 texture
+        var ovDesc = new VP_OUTPUT_VIEW_DESC { ViewDimension = 1, MipSlice = 0 };
+        var createOVFn = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, IntPtr, VP_OUTPUT_VIEW_DESC*, out IntPtr, int>)vpDevVt[9];
+        hr = createOVFn(_vpDevice, _vpNv12Texture, _vpEnum, &ovDesc, out _vpOutputView);
+        if (hr < 0) throw new Exception($"CreateVideoProcessorOutputView failed hr=0x{hr:X8}");
+
+        // Set output color space: YCbCr BT.709 studio range
+        var vpCtxVt = *(IntPtr**)_vpContext;
+        var outCs = new VP_COLOR_SPACE { Value = 0x6 }; // bit1=1(studio RGB range), bit2=1(BT.709)
+        var setOutCsFn = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, VP_COLOR_SPACE*, void>)vpCtxVt[15];
+        setOutCsFn(_vpContext, _vpProcessor, &outCs);
+
+        // Set stream frame format: progressive
+        var setFrameFmtFn = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, uint, int, void>)vpCtxVt[27];
+        setFrameFmtFn(_vpContext, _vpProcessor, 0, 0); // stream 0, progressive
+
+        // Set input color space: RGB full range
+        var inCs = new VP_COLOR_SPACE { Value = 0 }; // all zeros = playback, full RGB range
+        var setInCsFn = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, uint, VP_COLOR_SPACE*, void>)vpCtxVt[28];
+        setInCsFn(_vpContext, _vpProcessor, 0, &inCs);
+
+        ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Video Processor ready: BGRA {w}x{h} → NV12");
+    }
+
+    private void VideoProcessorConvert(IntPtr bgraTexture)
+    {
+        // Create input view for this BGRA texture (created per-frame since texture can change)
+        var ivDesc = new VP_INPUT_VIEW_DESC { FourCC = 0, ViewDimension = 1, MipSlice = 0, ArraySlice = 0 };
+        var vpDevVt = *(IntPtr**)_vpDevice;
+        var createIVFn = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, IntPtr, VP_INPUT_VIEW_DESC*, out IntPtr, int>)vpDevVt[8];
+        int hr = createIVFn(_vpDevice, bgraTexture, _vpEnum, &ivDesc, out IntPtr inputView);
+        if (hr < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] CreateVideoProcessorInputView failed hr=0x{hr:X8}"); return; }
+
+        // Blt: BGRA → NV12
+        var stream = new VP_STREAM
+        {
+            Enable = 1,
+            OutputIndex = 0, InputFrameOrField = 0,
+            PastFrames = 0, FutureFrames = 0,
+            pInputSurface = inputView
+        };
+        var vpCtxVt = *(IntPtr**)_vpContext;
+        var bltFn = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, IntPtr, uint, uint, VP_STREAM*, int>)vpCtxVt[53];
+        hr = bltFn(_vpContext, _vpProcessor, _vpOutputView, 0, 1, &stream);
+        if (hr < 0) ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] VideoProcessorBlt failed hr=0x{hr:X8}");
+
+        Marshal.Release(inputView);
     }
 
     private static string FfmpegError(int error)
@@ -928,9 +922,18 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: freeing hw contexts");
             try { if (_hwFramesCtx != null) { var h = _hwFramesCtx; ffmpeg.av_buffer_unref(&h); _hwFramesCtx = null; } } catch (Exception ex) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: hwFrames free error: {ex.Message}"); _hwFramesCtx = null; }
             try { if (_hwDeviceCtx != null) { var h = _hwDeviceCtx; ffmpeg.av_buffer_unref(&h); _hwDeviceCtx = null; } } catch (Exception ex) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: hwDevice free error: {ex.Message}"); _hwDeviceCtx = null; }
-            try { if (_cpuFrame != null) { var f = _cpuFrame; ffmpeg.av_frame_free(&f); _cpuFrame = null; } } catch (Exception ex) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: cpuFrame free error: {ex.Message}"); _cpuFrame = null; }
-            try { if (_swsColorCtx != null) { ffmpeg.sws_freeContext(_swsColorCtx); _swsColorCtx = null; } } catch (Exception ex) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: sws free error: {ex.Message}"); _swsColorCtx = null; }
-            try { if (_stagingTex != IntPtr.Zero) { Marshal.Release(_stagingTex); _stagingTex = IntPtr.Zero; } } catch (Exception ex) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: staging free error: {ex.Message}"); _stagingTex = IntPtr.Zero; }
+            // Video Processor cleanup
+            try
+            {
+                if (_vpOutputView != IntPtr.Zero) { Marshal.Release(_vpOutputView); _vpOutputView = IntPtr.Zero; }
+                if (_vpInputView != IntPtr.Zero) { Marshal.Release(_vpInputView); _vpInputView = IntPtr.Zero; }
+                if (_vpNv12Texture != IntPtr.Zero) { Marshal.Release(_vpNv12Texture); _vpNv12Texture = IntPtr.Zero; }
+                if (_vpProcessor != IntPtr.Zero) { Marshal.Release(_vpProcessor); _vpProcessor = IntPtr.Zero; }
+                if (_vpEnum != IntPtr.Zero) { Marshal.Release(_vpEnum); _vpEnum = IntPtr.Zero; }
+                if (_vpContext != IntPtr.Zero) { Marshal.Release(_vpContext); _vpContext = IntPtr.Zero; }
+                if (_vpDevice != IntPtr.Zero) { Marshal.Release(_vpDevice); _vpDevice = IntPtr.Zero; }
+            }
+            catch (Exception ex) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: VP cleanup error: {ex.Message}"); }
         }
         finally { if (ctxLock != null) Monitor.Exit(ctxLock); }
         _audioCapture = null;

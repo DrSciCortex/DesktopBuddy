@@ -181,11 +181,6 @@ public sealed class WgcCapture : IDisposable
     /// </summary>
     public Action<IntPtr, IntPtr, int, int> OnGpuFrame;
 
-    /// <summary>
-    /// Called with (rgbaData, width, height) after CPU readback. RGBA pixel data, no padding.
-    /// Runs on WGC background thread. Data is valid until next frame.
-    /// </summary>
-    public Action<byte[], int, int> OnCpuFrame;
 
     private IntPtr _hwnd;
     private bool _isDesktop;
@@ -457,13 +452,6 @@ public sealed class WgcCapture : IDisposable
                 }
                 if (_framesCaptured == 1) ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] First frame ready: {w}x{h}, GPU compute shader active");
 
-                // CPU frame callback for AMF encoder (RGBA data already in _buffer)
-                var cpuCb = OnCpuFrame;
-                if (cpuCb != null)
-                {
-                    try { cpuCb(_buffer, w, h); }
-                    catch (Exception cpuEx) { ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] OnCpuFrame error: {cpuEx.Message}"); }
-                }
             }
             finally { ContextUnmap(_d3dContext, _stagingTexture, 0); }
         }

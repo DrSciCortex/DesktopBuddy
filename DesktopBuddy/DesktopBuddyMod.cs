@@ -888,19 +888,11 @@ public class DesktopBuddyMod : ResoniteMod
                 {
                     var audioForEncoder = shared.Audio;
                     var contextLock = session.Streamer.D3dContextLock;
-                    // GPU callback: initialize encoder on first frame, encode for NVENC
                     session.Streamer.OnGpuFrame = (device, texture, fw, fh) =>
                     {
                         if (!nvEncoder.IsInitialized)
                             nvEncoder.Initialize(device, (uint)fw, (uint)fh, contextLock, audioForEncoder);
-                        if (!nvEncoder.NeedsCpuFrames)
-                            nvEncoder.EncodeFrame(texture, (uint)fw, (uint)fh);
-                    };
-                    // CPU callback: encode for AMF (RGBA data from WgcCapture's readback)
-                    session.Streamer.OnCpuFrame = (rgbaData, fw, fh) =>
-                    {
-                        if (nvEncoder.IsInitialized && nvEncoder.NeedsCpuFrames)
-                            nvEncoder.EncodeCpuFrame(rgbaData, (uint)fw, (uint)fh);
+                        nvEncoder.EncodeFrame(texture, (uint)fw, (uint)fh);
                     };
                     Msg($"[RemoteStream] This panel drives the encoder for stream {shared.StreamId}");
                 }
@@ -920,6 +912,7 @@ public class DesktopBuddyMod : ResoniteMod
                 // AudioOutput required for VideoTextureProvider to actually play audio
                 var audioOutput = videoSlot.AttachComponent<AudioOutput>();
                 audioOutput.Source.Target = videoTex;
+                audioOutput.AudioTypeGroup.Value = AudioTypeGroup.Multimedia;
 
                 // Per-user volume: others hear at 100%, spawner hears nothing (test stream toggles)
                 var volOverride = videoSlot.AttachComponent<ValueUserOverride<float>>();
@@ -1194,9 +1187,9 @@ public class DesktopBuddyMod : ResoniteMod
         Msg($"[Cleanup] Removing canvas ID");
         if (session.Canvas != null) DesktopCanvasIds.Remove(session.Canvas.ReferenceID);
 
-        Msg($"[Cleanup] Nulling OnGpuFrame/OnCpuFrame callbacks");
+        Msg($"[Cleanup] Nulling OnGpuFrame callback");
         var streamer = session.Streamer;
-        if (streamer != null) { streamer.OnGpuFrame = null; streamer.OnCpuFrame = null; }
+        if (streamer != null) streamer.OnGpuFrame = null;
         int streamId = session.StreamId;
         IntPtr hwnd = session.Hwnd;
         session.Streamer = null;

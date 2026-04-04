@@ -25,11 +25,6 @@ public sealed class DesktopStreamer : IDisposable
         set { if (_wgc != null) _wgc.OnGpuFrame = value; }
     }
 
-    public Action<byte[], int, int> OnCpuFrame
-    {
-        get => _wgc?.OnCpuFrame;
-        set { if (_wgc != null) _wgc.OnCpuFrame = value; }
-    }
 
 
     public DesktopStreamer(IntPtr hwnd)
