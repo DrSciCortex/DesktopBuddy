@@ -75,6 +75,11 @@ unsafe class Program
             FfmpegEncoderTest.Run();
             return;
         }
+        if (args.Length > 0 && args[0] == "audio")
+        {
+            AudioCaptureTest.Run();
+            return;
+        }
 
         Console.WriteLine("=== GPU Compute Shader Test ===");
 

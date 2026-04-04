@@ -40,6 +40,7 @@ public class DesktopBuddyMod : ResoniteMod
     {
         public int StreamId;
         public FfmpegEncoder Encoder;
+        public AudioCapture Audio;
         public Uri StreamUrl;
         public int RefCount;
     }
@@ -57,6 +58,8 @@ public class DesktopBuddyMod : ResoniteMod
 
         Harmony harmony = new("com.desktopbuddy.mod");
         harmony.PatchAll();
+
+        AudioCapture.LogHandler = Msg;
 
         // Start streaming server for remote user support
         try
@@ -426,6 +429,7 @@ public class DesktopBuddyMod : ResoniteMod
         bool streamTestMode = false;
         ValueUserOverride<bool> streamVisRef = null; // Set when stream is created
         VideoTextureProvider videoTexRef = null; // Set when stream is created
+        ValueUserOverride<float> volOverrideRef = null; // Set when stream is created
         testStreamBtn.LocalPressed += (IButton b, ButtonEventData d) =>
         {
             Msg("[TestStream] Button pressed");
@@ -437,7 +441,9 @@ public class DesktopBuddyMod : ResoniteMod
                 var displayVisComp = displaySlot.GetComponent<ValueUserOverride<bool>>();
                 if (displayVisComp != null)
                     displayVisComp.SetOverride(root.World.LocalUser, !streamTestMode);
-                Msg($"[TestStream] Test mode: {streamTestMode} (stream={streamTestMode}, preview={!streamTestMode})");
+                if (volOverrideRef != null && !volOverrideRef.IsDestroyed)
+                    volOverrideRef.SetOverride(root.World.LocalUser, streamTestMode ? 1f : 0f);
+                Msg($"[TestStream] Test mode: {streamTestMode} (stream={streamTestMode}, preview={!streamTestMode}, volume={( streamTestMode ? 1f : 0f)})");
             }
             else
             {
@@ -628,8 +634,16 @@ public class DesktopBuddyMod : ResoniteMod
                     {
                         int streamId = System.Threading.Interlocked.Increment(ref _nextStreamId);
                         var encoder = StreamServer.CreateEncoder(streamId);
+
+                        // Start audio capture — per-window or desktop-minus-Resonite
+                        var audio = new AudioCapture();
+                        if (hwnd != IntPtr.Zero)
+                            audio.Start(hwnd, AudioCaptureMode.IncludeProcess);
+                        else
+                            audio.Start(IntPtr.Zero, AudioCaptureMode.ExcludeProcess);
+
                         var url = new Uri($"{TunnelUrl}/stream/{streamId}");
-                        shared = new SharedStream { StreamId = streamId, Encoder = encoder, StreamUrl = url, RefCount = 0 };
+                        shared = new SharedStream { StreamId = streamId, Encoder = encoder, Audio = audio, StreamUrl = url, RefCount = 0 };
                         if (hwnd != IntPtr.Zero)
                             _sharedStreams[hwnd] = shared;
                         Msg($"[RemoteStream] Created new shared stream {streamId} for hwnd={hwnd}");
@@ -649,10 +663,11 @@ public class DesktopBuddyMod : ResoniteMod
                 bool isFirstForHwnd = shared.RefCount == 1;
                 if (isFirstForHwnd)
                 {
+                    var audioForEncoder = shared.Audio;
                     session.Streamer.OnGpuFrame = (device, texture, fw, fh) =>
                     {
                         if (!nvEncoder.IsInitialized)
-                            nvEncoder.Initialize(device, (uint)fw, (uint)fh);
+                            nvEncoder.Initialize(device, (uint)fw, (uint)fh, audioForEncoder);
                         nvEncoder.EncodeFrame(texture, (uint)fw, (uint)fh);
                     };
                     Msg($"[RemoteStream] This panel drives the encoder for stream {shared.StreamId}");
@@ -667,8 +682,20 @@ public class DesktopBuddyMod : ResoniteMod
                 var videoTex = videoSlot.AttachComponent<VideoTextureProvider>();
                 videoTex.URL.Value = shared.StreamUrl;
                 videoTex.Stream.Value = true;
-                videoTex.Volume.Value = 0f;
+                videoTex.Volume.Value = 0f; // Start muted — test stream button enables audio
                 videoTexRef = videoTex;
+
+                // AudioOutput required for VideoTextureProvider to actually play audio
+                var audioOutput = videoSlot.AttachComponent<AudioOutput>();
+                audioOutput.Source.Target = videoTex;
+
+                // Per-user volume: others hear at 100%, spawner hears nothing (test stream toggles)
+                var volOverride = videoSlot.AttachComponent<ValueUserOverride<float>>();
+                volOverride.Target.Target = audioOutput.Volume;
+                volOverride.Default.Value = 1f; // Other users: full volume
+                volOverride.CreateOverrideOnWrite.Value = false;
+                volOverride.SetOverride(root.World.LocalUser, 0f); // Spawner: muted
+                volOverrideRef = volOverride;
 
                 // Visual display on a separate slot with per-user visibility
                 var streamSlot = root.AddSlot("RemoteStreamVisual");
@@ -707,6 +734,14 @@ public class DesktopBuddyMod : ResoniteMod
                     bool isPlaying = videoTex.IsPlaying;
                     float clockErr = videoTex.CurrentClockError?.Value ?? -1f;
                     Msg($"[RemoteStream] Check #{checkCount}: avail={assetAvail} engine={playbackEngine} playing={isPlaying} clockErr={clockErr:F2}");
+
+                    // Start playback once asset is available — required for audio to work
+                    if (assetAvail && !isPlaying)
+                    {
+                        videoTex.Play();
+                        Msg("[RemoteStream] Called Play() on VideoTextureProvider");
+                    }
+
                     if (checkCount < 10)
                         root.World.RunInUpdates(60, () => CheckVideoState());
                     else if (checkCount < 30)
@@ -781,33 +816,69 @@ public class DesktopBuddyMod : ResoniteMod
 
     private static void CleanupSession(DesktopSession session)
     {
-        session.Streamer?.Dispose();
         if (session.Canvas != null) DesktopCanvasIds.Remove(session.Canvas.ReferenceID);
 
-        // Shared stream ref counting — only stop encoder when last panel is removed
-        if (session.StreamId > 0)
+        // Heavy dispose (thread joins, FFmpeg teardown, GPU resource release) on background
+        // thread so the engine update loop isn't blocked
+        var streamer = session.Streamer;
+        int streamId = session.StreamId;
+        IntPtr hwnd = session.Hwnd;
+        session.Streamer = null;
+
+        System.Threading.ThreadPool.QueueUserWorkItem(_ =>
         {
-            lock (_sharedStreams)
+            try
             {
-                if (_sharedStreams.TryGetValue(session.Hwnd, out var shared) && shared.StreamId == session.StreamId)
+                Msg($"[Cleanup] Background dispose starting for stream {streamId}");
+                streamer?.Dispose();
+                Msg($"[Cleanup] Streamer disposed for stream {streamId}");
+
+                if (streamId > 0)
                 {
-                    shared.RefCount--;
-                    Msg($"[Cleanup] Stream {shared.StreamId} refs now {shared.RefCount}");
-                    if (shared.RefCount <= 0)
+                    // Decide what to clean up under the lock, but do the heavy
+                    // Dispose/StopEncoder OUTSIDE the lock to avoid deadlocking
+                    // the engine thread if it tries to lock _sharedStreams during spawn
+                    AudioCapture audioToDispose = null;
+                    bool shouldStopEncoder = false;
+
+                    lock (_sharedStreams)
                     {
-                        _sharedStreams.Remove(session.Hwnd);
-                        StreamServer?.StopEncoder(session.StreamId);
-                        Msg($"[Cleanup] Last ref removed, encoder {session.StreamId} stopped");
+                        if (_sharedStreams.TryGetValue(hwnd, out var shared) && shared.StreamId == streamId)
+                        {
+                            shared.RefCount--;
+                            Msg($"[Cleanup] Stream {shared.StreamId} refs now {shared.RefCount}");
+                            if (shared.RefCount <= 0)
+                            {
+                                _sharedStreams.Remove(hwnd);
+                                audioToDispose = shared.Audio;
+                                shouldStopEncoder = true;
+                            }
+                        }
+                        else
+                        {
+                            shouldStopEncoder = true;
+                        }
+                    }
+
+                    // Heavy teardown outside the lock
+                    if (audioToDispose != null)
+                    {
+                        audioToDispose.Dispose();
+                        Msg($"[Cleanup] Audio disposed for stream {streamId}");
+                    }
+                    if (shouldStopEncoder)
+                    {
+                        StreamServer?.StopEncoder(streamId);
+                        Msg($"[Cleanup] Encoder {streamId} stopped");
                     }
                 }
-                else
-                {
-                    // Orphaned stream (hwnd mismatch or already removed) — stop directly
-                    StreamServer?.StopEncoder(session.StreamId);
-                    Msg($"[Cleanup] Orphaned stream {session.StreamId} stopped");
-                }
+                Msg($"[Cleanup] Background dispose finished for stream {streamId}");
             }
-        }
+            catch (Exception ex)
+            {
+                Msg($"[Cleanup] Background dispose error: {ex}");
+            }
+        });
     }
 
     private static void UpdateLoop(World world)
@@ -817,7 +888,17 @@ public class DesktopBuddyMod : ResoniteMod
 
         if (world.IsDestroyed)
         {
-            Msg("[UpdateLoop] World destroyed, stopping loop");
+            Msg("[UpdateLoop] World destroyed, cleaning up sessions for this world");
+            for (int i = ActiveSessions.Count - 1; i >= 0; i--)
+            {
+                var session = ActiveSessions[i];
+                if (session.Root == null || session.Root.IsDestroyed || session.Root.World == world)
+                {
+                    Msg($"[UpdateLoop] Cleaning up session {i} (world destroyed)");
+                    CleanupSession(session);
+                    ActiveSessions.RemoveAt(i);
+                }
+            }
             _scheduledWorlds.Remove(world);
             return;
         }
@@ -840,11 +921,13 @@ public class DesktopBuddyMod : ResoniteMod
                 if (session.Root.World != world) continue;
                 if (session.UpdateInProgress) continue;
 
-                // Window closed — destroy viewer
+                // Window closed — destroy viewer safely by detaching children first
                 if (!session.Streamer.IsValid)
                 {
                     Msg($"[UpdateLoop] Window closed (IsValid=false), destroying viewer");
                     CleanupSession(session);
+                    // Destroy children first to avoid cascade NullRefs in engine OnChanges
+                    session.Root.DestroyChildren();
                     session.Root.Destroy();
                     ActiveSessions.RemoveAt(i);
                     continue;

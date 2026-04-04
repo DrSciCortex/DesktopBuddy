@@ -350,6 +350,10 @@ public sealed class WgcCapture : IDisposable
 
     private void OnFrameArrived(Direct3D11CaptureFramePool sender, object args)
     {
+        if (_disposed) return;
+        lock (_disposeLock)
+        {
+        if (_disposed) return;
         try
         {
         using var frame = sender.TryGetNextFrame();
@@ -466,6 +470,7 @@ public sealed class WgcCapture : IDisposable
         {
             ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] OnFrameArrived OUTER error: {ex.Message}\n{ex.StackTrace}");
         }
+        } // lock (_disposeLock)
     }
 
     /// <summary>
@@ -807,21 +812,28 @@ public sealed class WgcCapture : IDisposable
         return buffer;
     }
 
+    private readonly object _disposeLock = new();
+
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
 
+        // Stop WGC from delivering new frames
         try { _session?.Dispose(); } catch { }
         try { _framePool?.Dispose(); } catch { }
         _item = null;
 
-        ReleaseGpuConvertResources();
-        if (_computeShader != IntPtr.Zero) { Marshal.Release(_computeShader); _computeShader = IntPtr.Zero; }
-        if (_encodeTexture != IntPtr.Zero) { Marshal.Release(_encodeTexture); _encodeTexture = IntPtr.Zero; }
-        if (_stagingTexture != IntPtr.Zero) { Marshal.Release(_stagingTexture); _stagingTexture = IntPtr.Zero; }
-        if (_d3dContext != IntPtr.Zero) { Marshal.Release(_d3dContext); _d3dContext = IntPtr.Zero; }
-        if (_d3dDevice != IntPtr.Zero) { Marshal.Release(_d3dDevice); _d3dDevice = IntPtr.Zero; }
+        // Wait for any in-flight OnFrameArrived callback to finish
+        lock (_disposeLock)
+        {
+            ReleaseGpuConvertResources();
+            if (_computeShader != IntPtr.Zero) { Marshal.Release(_computeShader); _computeShader = IntPtr.Zero; }
+            if (_encodeTexture != IntPtr.Zero) { Marshal.Release(_encodeTexture); _encodeTexture = IntPtr.Zero; }
+            if (_stagingTexture != IntPtr.Zero) { Marshal.Release(_stagingTexture); _stagingTexture = IntPtr.Zero; }
+            if (_d3dContext != IntPtr.Zero) { Marshal.Release(_d3dContext); _d3dContext = IntPtr.Zero; }
+            if (_d3dDevice != IntPtr.Zero) { Marshal.Release(_d3dDevice); _d3dDevice = IntPtr.Zero; }
+        }
         try { _winrtDevice?.Dispose(); } catch { }
 
         if (_pinnedBuffer.IsAllocated) _pinnedBuffer.Free();

@@ -18,7 +18,7 @@ public sealed unsafe class FfmpegEncoder : IDisposable
     private bool _initialized;
     private bool _initFailed;
 
-    // FFmpeg contexts
+    // FFmpeg video contexts
     private AVCodecContext* _codecCtx;
     private AVFormatContext* _fmtCtx;
     private AVIOContext* _ioCtx;
@@ -27,6 +27,16 @@ public sealed unsafe class FfmpegEncoder : IDisposable
     private AVBufferRef* _hwFramesCtx;
     private AVFrame* _hwFrame;
     private AVPacket* _pkt;
+
+    // FFmpeg audio contexts
+    private AVCodecContext* _audioCodecCtx;
+    private AVStream* _audioStream;
+    private AVFrame* _audioFrame;
+    private SwrContext* _swrCtx; // Resampler for sample rate/format conversion
+    private AudioCapture _audioCapture;
+    private long _audioReadPos; // Position in AudioCapture ring buffer
+    private long _audioSamplesEncoded;
+    private float[] _audioScratch; // Temp buffer for reading from AudioCapture
 
     // Ring buffer: MPEG-TS data written here by AVIO callback. HTTP clients read from it.
     private byte[] _ringBuffer;
@@ -53,6 +63,7 @@ public sealed unsafe class FfmpegEncoder : IDisposable
     private IntPtr _lastTexture; // Last encoded texture for keepalive re-encode
     private uint _lastWidth, _lastHeight;
     private long _startTicks;
+    private long _lastVideoPts = -1; // Ensure monotonic pts
 
     // Pin this delegate so GC doesn't collect it while AVIO holds a pointer
     private avio_alloc_context_write_packet _writeCallbackDelegate;
@@ -165,7 +176,7 @@ public sealed unsafe class FfmpegEncoder : IDisposable
     /// </summary>
     private readonly object _initLock = new();
 
-    public bool Initialize(IntPtr d3dDevice, uint width, uint height)
+    public bool Initialize(IntPtr d3dDevice, uint width, uint height, AudioCapture audioCapture = null)
     {
         lock (_initLock)
         {
@@ -205,7 +216,7 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             _codecCtx->gop_size = (int)_fps; // Keyframe every 1s
             _codecCtx->max_b_frames = 0; // No B-frames — critical for low latency
             _codecCtx->pix_fmt = AVPixelFormat.AV_PIX_FMT_D3D11;
-            _codecCtx->flags |= ffmpeg.AV_CODEC_FLAG_LOW_DELAY;
+            _codecCtx->flags |= ffmpeg.AV_CODEC_FLAG_LOW_DELAY | ffmpeg.AV_CODEC_FLAG_GLOBAL_HEADER;
             _codecCtx->bit_rate = 8_000_000; // 8 Mbps target — good for 1080p motion
             _codecCtx->rc_max_rate = 12_000_000; // 12 Mbps ceiling for burst scenes
             _codecCtx->rc_buffer_size = 8_000_000; // 1s buffer at target rate
@@ -231,6 +242,11 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             // Allocate frame and packet
             _hwFrame = ffmpeg.av_frame_alloc();
             _pkt = ffmpeg.av_packet_alloc();
+
+            // Store audio capture reference before muxer setup (muxer adds audio stream if available)
+            _audioCapture = audioCapture;
+            _audioReadPos = 0;
+            _audioSamplesEncoded = 0;
 
             // Set up MPEG-TS muxer with custom I/O to ring buffer
             SetupMuxer();
@@ -332,11 +348,51 @@ public sealed unsafe class FfmpegEncoder : IDisposable
         ffmpeg.avcodec_parameters_from_context(_stream->codecpar, _codecCtx);
         _stream->time_base = _codecCtx->time_base;
 
-        // Write MPEG-TS header
+        // Add audio stream if audio capture is available
+        if (_audioCapture != null && _audioCapture.IsCapturing)
+        {
+            SetupAudioStream();
+        }
+
+        // Write MPEG-TS header (must be after all streams are added)
         ret = ffmpeg.avformat_write_header(_fmtCtx, null);
         if (ret < 0) throw new Exception($"avformat_write_header failed: {FfmpegError(ret)}");
 
         ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] MPEG-TS muxer ready (in-process, no external ffmpeg)");
+    }
+
+    private void SetupAudioStream()
+    {
+        var audioCodec = ffmpeg.avcodec_find_encoder(AVCodecID.AV_CODEC_ID_AAC);
+        if (audioCodec == null) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] AAC encoder not found, audio disabled"); return; }
+
+        _audioCodecCtx = ffmpeg.avcodec_alloc_context3(audioCodec);
+        _audioCodecCtx->sample_rate = 48000;
+        _audioCodecCtx->ch_layout = new AVChannelLayout { order = AVChannelOrder.AV_CHANNEL_ORDER_NATIVE, nb_channels = 2, u = new AVChannelLayout_u { mask = ffmpeg.AV_CH_LAYOUT_STEREO } };
+        _audioCodecCtx->sample_fmt = AVSampleFormat.AV_SAMPLE_FMT_FLTP; // AAC needs planar float
+        _audioCodecCtx->bit_rate = 128000;
+        _audioCodecCtx->time_base = new AVRational { num = 1, den = 48000 };
+        _audioCodecCtx->flags |= ffmpeg.AV_CODEC_FLAG_GLOBAL_HEADER; // MPEG-TS needs this
+
+        int ret = ffmpeg.avcodec_open2(_audioCodecCtx, audioCodec, null);
+        if (ret < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Audio codec open failed: {FfmpegError(ret)}"); return; }
+
+        _audioStream = ffmpeg.avformat_new_stream(_fmtCtx, null);
+        ffmpeg.avcodec_parameters_from_context(_audioStream->codecpar, _audioCodecCtx);
+        _audioStream->time_base = _audioCodecCtx->time_base;
+
+        // Allocate audio frame (1024 samples per AAC frame)
+        _audioFrame = ffmpeg.av_frame_alloc();
+        _audioFrame->nb_samples = _audioCodecCtx->frame_size; // Usually 1024 for AAC
+        _audioFrame->format = (int)AVSampleFormat.AV_SAMPLE_FMT_FLTP;
+        _audioFrame->ch_layout = _audioCodecCtx->ch_layout;
+        _audioFrame->sample_rate = 48000;
+        ffmpeg.av_frame_get_buffer(_audioFrame, 0);
+
+        // Source is 48kHz float32 stereo — matches encoder, no resampling needed
+
+        _audioScratch = new float[48000 * 2]; // 1 second scratch buffer
+        ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Audio stream added: AAC 48kHz stereo 128kbps");
     }
 
     private static int WriteCallback(void* opaque, byte* buf, int buf_size)
@@ -458,7 +514,12 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             CopyTextureToFrame(_deviceContext, dstTexture, dstIndex, srcTexture, (int)_width, (int)_height);
         }
 
-        _hwFrame->pts = _totalFrames;
+        // Wall clock pts — monotonically increasing, never duplicate
+        double elapsedSec = (double)(System.Diagnostics.Stopwatch.GetTimestamp() - _startTicks) / System.Diagnostics.Stopwatch.Frequency;
+        long videoPts = (long)(elapsedSec * _fps);
+        if (videoPts <= _lastVideoPts) videoPts = _lastVideoPts + 1;
+        _lastVideoPts = videoPts;
+        _hwFrame->pts = videoPts;
         _hwFrame->width = (int)_width;
         _hwFrame->height = (int)_height;
 
@@ -482,16 +543,84 @@ public sealed unsafe class FfmpegEncoder : IDisposable
                 _pkt->stream_index = _stream->index;
                 ffmpeg.av_packet_rescale_ts(_pkt, _codecCtx->time_base, _stream->time_base);
 
-                ret = ffmpeg.av_interleaved_write_frame(_fmtCtx, _pkt);
-                if (ret < 0) ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] av_interleaved_write_frame failed: {FfmpegError(ret)}");
+                ret = ffmpeg.av_write_frame(_fmtCtx, _pkt);
+                if (ret < 0) ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] av_write_frame (video) failed: {FfmpegError(ret)}");
 
                 ffmpeg.av_packet_unref(_pkt);
             }
         }
 
+        // Encode audio samples accumulated since last video frame
+        if (_audioCodecCtx != null && _audioCapture != null)
+        {
+            using (DesktopBuddyMod.Perf.Time("ffmpeg_audio"))
+                EncodeAudio();
+        }
+
+        // Flush AVIO buffer so packets reach the ring buffer immediately
+        ffmpeg.avio_flush(_fmtCtx->pb);
+
         _totalFrames++;
         if (_totalFrames <= 5 || _totalFrames % 300 == 0)
             ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Frame #{_totalFrames} ({width}x{height}), ringPos={_ringWritePos}");
+    }
+
+    private void EncodeAudio()
+    {
+        if (_audioScratch == null || _audioFrame == null) return;
+
+        int frameSize = _audioCodecCtx->frame_size; // 1024 for AAC
+        int channels = 2;
+        int samplesPerFrame = frameSize * channels; // interleaved samples needed
+
+        // Read all available audio — no cap, encode everything that's accumulated
+        int read = _audioCapture.ReadSamples(_audioScratch, _audioScratch.Length, ref _audioReadPos);
+        if (read <= 0) return;
+
+        // Process in AAC frame-sized chunks
+        int offset = 0;
+        while (offset + samplesPerFrame <= read)
+        {
+            ffmpeg.av_frame_make_writable(_audioFrame);
+            _audioFrame->nb_samples = frameSize;
+
+            float* left = (float*)_audioFrame->data[0];
+            float* right = (float*)_audioFrame->data[1];
+            fixed (float* src = &_audioScratch[offset])
+            {
+                for (int i = 0; i < frameSize; i++)
+                {
+                    left[i] = src[i * channels];
+                    right[i] = src[i * channels + 1];
+                }
+            }
+
+            _audioFrame->pts = _audioSamplesEncoded;
+            _audioSamplesEncoded += frameSize;
+
+            int ret = ffmpeg.avcodec_send_frame(_audioCodecCtx, _audioFrame);
+            if (ret < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Audio send_frame failed: {FfmpegError(ret)}"); break; }
+
+            while (true)
+            {
+                ret = ffmpeg.avcodec_receive_packet(_audioCodecCtx, _pkt);
+                if (ret == ffmpeg.AVERROR(ffmpeg.EAGAIN) || ret == ffmpeg.AVERROR_EOF) break;
+                if (ret < 0) break;
+
+                _pkt->stream_index = _audioStream->index;
+                ffmpeg.av_packet_rescale_ts(_pkt, _audioCodecCtx->time_base, _audioStream->time_base);
+                ffmpeg.av_write_frame(_fmtCtx, _pkt);
+                ffmpeg.av_packet_unref(_pkt);
+            }
+
+            offset += samplesPerFrame;
+        }
+
+        // Put back unconsumed samples — only whole AAC frames are encoded,
+        // remainder is picked up next call
+        int unconsumed = read - offset;
+        if (unconsumed > 0)
+            _audioReadPos -= unconsumed;
     }
 
     /// <summary>
@@ -540,10 +669,13 @@ public sealed unsafe class FfmpegEncoder : IDisposable
 
         if (_pkt != null) { var p = _pkt; ffmpeg.av_packet_free(&p); _pkt = null; }
         if (_hwFrame != null) { var f = _hwFrame; ffmpeg.av_frame_free(&f); _hwFrame = null; }
+        if (_audioFrame != null) { var f = _audioFrame; ffmpeg.av_frame_free(&f); _audioFrame = null; }
+        if (_audioCodecCtx != null) { var c = _audioCodecCtx; ffmpeg.avcodec_free_context(&c); _audioCodecCtx = null; }
+        if (_swrCtx != null) { var s = _swrCtx; ffmpeg.swr_free(&s); _swrCtx = null; }
         if (_codecCtx != null) { var c = _codecCtx; ffmpeg.avcodec_free_context(&c); _codecCtx = null; }
         if (_hwFramesCtx != null) { var h = _hwFramesCtx; ffmpeg.av_buffer_unref(&h); _hwFramesCtx = null; }
-        // Don't unref _hwDeviceCtx device pointer — we don't own it (WgcCapture does)
         if (_hwDeviceCtx != null) { var h = _hwDeviceCtx; ffmpeg.av_buffer_unref(&h); _hwDeviceCtx = null; }
+        _audioCapture = null;
 
         if (_fmtCtx != null)
         {
