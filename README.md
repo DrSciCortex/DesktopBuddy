@@ -71,7 +71,7 @@ Creates `DesktopBuddy.zip` from the last build. Extract into the Resonite root f
 **Streaming not working for other users?** The mod runs a local HTTP server on port 48080. If streaming isn't working, run this command once as Administrator to allow it through:
 
 ```
-netsh http add urlacl url=http://+:48080/ sddl=D:(A;;GX;;;S-1-1-0)
+netsh http add urlacl url=http://+:48080/ sddl="D:(A;;GX;;;S-1-1-0)"
 ```
 
 The mod tries to do this automatically, but it may fail without admin privileges.
