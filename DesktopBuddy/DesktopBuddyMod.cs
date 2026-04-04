@@ -91,26 +91,14 @@ public class DesktopBuddyMod : ResoniteMod
             catch (Exception ex) { Msg($"[Tunnel] Kill failed: {ex.Message}"); }
         };
 
-        // Check for updates in background
-        System.Threading.Tasks.Task.Run(() => CheckForUpdate());
-
         Msg("DesktopBuddy initialized!");
-    }
-
-    private static string GetBuildSha()
-    {
-        var attr = typeof(DesktopBuddyMod).Assembly
-            .GetCustomAttributes(typeof(System.Reflection.AssemblyMetadataAttribute), false)
-            .Cast<System.Reflection.AssemblyMetadataAttribute>()
-            .FirstOrDefault(a => a.Key == "GitSha");
-        return attr?.Value ?? "unknown";
     }
 
     private static void CheckForUpdate()
     {
         try
         {
-            var buildSha = GetBuildSha();
+            var buildSha = BuildInfo.GitSha;
             Msg($"[Update] Current build: {buildSha}");
 
             using var http = new System.Net.Http.HttpClient();
@@ -130,6 +118,55 @@ public class DesktopBuddyMod : ResoniteMod
         {
             Msg($"[Update] Check failed: {ex.Message}");
         }
+    }
+
+    private static void ShowUpdatePopup(Slot root, float w, float canvasScale)
+    {
+        Msg($"[Update] Showing update popup: {_latestVersion}");
+
+        var updateSlot = root.AddSlot("UpdateNotice");
+        updateSlot.LocalPosition = new float3(0f, 0f, -0.002f);
+        updateSlot.LocalScale = float3.One * canvasScale;
+
+        var updateCanvas = updateSlot.AttachComponent<Canvas>();
+        float popupW = Math.Min(w * 0.6f, 400f);
+        updateCanvas.Size.Value = new float2(popupW, 120f);
+        var updateUi = new UIBuilder(updateCanvas);
+
+        var bg = updateUi.Image(new colorX(0.12f, 0.12f, 0.15f, 0.95f));
+        updateUi.NestInto(bg.RectTransform);
+        updateUi.VerticalLayout(8f, childAlignment: Alignment.MiddleCenter);
+        updateUi.Style.FlexibleWidth = 1f;
+
+        updateUi.Style.MinHeight = 32f;
+        var msg = updateUi.Text("Update available!", bestFit: false, alignment: Alignment.MiddleCenter);
+        msg.Size.Value = 22f;
+        msg.Color.Value = new colorX(0.95f, 0.85f, 0.3f, 1f);
+
+        updateUi.Style.MinHeight = 36f;
+        var dlBtn = updateUi.Button("Download");
+        var dlTxt = dlBtn.Slot.GetComponentInChildren<TextRenderer>();
+        if (dlTxt != null) { dlTxt.Color.Value = new colorX(0.9f, 0.9f, 0.9f, 1f); dlTxt.Size.Value = 18f; }
+        if (dlBtn.ColorDrivers.Count > 0)
+        {
+            var cd = dlBtn.ColorDrivers[0];
+            cd.NormalColor.Value = new colorX(0.2f, 0.4f, 0.6f, 1f);
+            cd.HighlightColor.Value = new colorX(0.25f, 0.5f, 0.75f, 1f);
+            cd.PressColor.Value = new colorX(0.15f, 0.3f, 0.45f, 1f);
+        }
+        dlBtn.LocalPressed += (IButton b, ButtonEventData d) =>
+        {
+            Msg("[Update] Opening releases page");
+            try { Process.Start(new ProcessStartInfo("https://github.com/DevL0rd/DesktopBuddy/releases") { UseShellExecute = true }); }
+            catch (Exception ex) { Msg($"[Update] Failed: {ex.Message}"); }
+            if (!updateSlot.IsDestroyed) updateSlot.Destroy();
+        };
+
+        // Auto-dismiss after 15 seconds
+        root.World.RunInUpdates(15 * 60, () =>
+        {
+            if (!updateSlot.IsDestroyed) updateSlot.Destroy();
+        });
     }
 
     internal static void SpawnStreaming(World world, IntPtr hwnd, string title)
@@ -159,7 +196,7 @@ public class DesktopBuddyMod : ResoniteMod
         }
     }
 
-    private static void StartStreaming(Slot root, IntPtr hwnd, string title)
+    private static void StartStreaming(Slot root, IntPtr hwnd, string title, bool isChild = false)
     {
         Msg($"[StartStreaming] Window: {title} (hwnd={hwnd})");
 
@@ -776,54 +813,23 @@ public class DesktopBuddyMod : ResoniteMod
             Msg($"[BackPanel] Created with title '{title}'");
         }
 
-        // --- Update notification (once per session) ---
-        if (_latestVersion != null && !_updateShown)
+        // --- Update check (once per session, non-child panels only, async) ---
+        if (!_updateShown && !isChild)
         {
             _updateShown = true;
-            Msg($"[Update] Showing update popup: {_latestVersion}");
-
-            var updateSlot = root.AddSlot("UpdateNotice");
-            updateSlot.LocalPosition = new float3(0f, 0f, -0.002f); // slightly in front
-            updateSlot.LocalScale = float3.One * canvasScale;
-
-            var updateCanvas = updateSlot.AttachComponent<Canvas>();
-            float popupW = Math.Min(w * 0.6f, 400f);
-            updateCanvas.Size.Value = new float2(popupW, 120f);
-            var updateUi = new UIBuilder(updateCanvas);
-
-            var bg = updateUi.Image(new colorX(0.12f, 0.12f, 0.15f, 0.95f));
-            updateUi.NestInto(bg.RectTransform);
-            updateUi.VerticalLayout(8f, childAlignment: Alignment.MiddleCenter);
-            updateUi.Style.FlexibleWidth = 1f;
-
-            updateUi.Style.MinHeight = 32f;
-            var msg = updateUi.Text("Update available!", bestFit: false, alignment: Alignment.MiddleCenter);
-            msg.Size.Value = 22f;
-            msg.Color.Value = new colorX(0.95f, 0.85f, 0.3f, 1f);
-
-            updateUi.Style.MinHeight = 36f;
-            var dlBtn = updateUi.Button("Download");
-            var dlTxt = dlBtn.Slot.GetComponentInChildren<TextRenderer>();
-            if (dlTxt != null) { dlTxt.Color.Value = new colorX(0.9f, 0.9f, 0.9f, 1f); dlTxt.Size.Value = 18f; }
-            if (dlBtn.ColorDrivers.Count > 0)
+            var capturedRoot = root;
+            var capturedWorld = root.World;
+            float capturedW = w;
+            float capturedScale = canvasScale;
+            System.Threading.Tasks.Task.Run(() =>
             {
-                var cd = dlBtn.ColorDrivers[0];
-                cd.NormalColor.Value = new colorX(0.2f, 0.4f, 0.6f, 1f);
-                cd.HighlightColor.Value = new colorX(0.25f, 0.5f, 0.75f, 1f);
-                cd.PressColor.Value = new colorX(0.15f, 0.3f, 0.45f, 1f);
-            }
-            dlBtn.LocalPressed += (IButton b, ButtonEventData d) =>
-            {
-                Msg("[Update] Opening releases page");
-                try { Process.Start(new ProcessStartInfo("https://github.com/DevL0rd/DesktopBuddy/releases") { UseShellExecute = true }); }
-                catch (Exception ex) { Msg($"[Update] Failed: {ex.Message}"); }
-                if (!updateSlot.IsDestroyed) updateSlot.Destroy();
-            };
-
-            // Auto-dismiss after 15 seconds
-            root.World.RunInUpdates(15 * 60, () =>
-            {
-                if (!updateSlot.IsDestroyed) updateSlot.Destroy();
+                CheckForUpdate();
+                if (_latestVersion == null) return;
+                capturedWorld.RunInUpdates(0, () =>
+                {
+                    if (capturedRoot.IsDestroyed) return;
+                    ShowUpdatePopup(capturedRoot, capturedW, capturedScale);
+                });
             });
         }
 
@@ -1046,7 +1052,7 @@ public class DesktopBuddyMod : ResoniteMod
 
         try
         {
-            StartStreaming(root, childHwnd, title);
+            StartStreaming(root, childHwnd, title, isChild: true);
 
             // Find the session that was just created and set up parent-child relationship
             var childSession = ActiveSessions.Find(s => s.Hwnd == childHwnd && s.Root == root);

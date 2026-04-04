@@ -6,22 +6,20 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
-    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
   </PropertyGroup>
 
-  <!-- Embed git SHA at build time -->
-  <Target Name="SetGitSha" BeforeTargets="GenerateAssemblyInfo">
+  <!-- Embed git SHA as a compiled const that survives ILRepack -->
+  <Target Name="GenerateBuildInfo" BeforeTargets="CoreCompile">
     <Exec Command="git rev-parse --short HEAD" ConsoleToMsBuild="true" StandardOutputImportance="low" ContinueOnError="true">
       <Output TaskParameter="ConsoleOutput" PropertyName="GitSha" />
     </Exec>
     <PropertyGroup>
       <GitSha Condition="'$(GitSha)' == ''">unknown</GitSha>
+      <BuildInfoContent>namespace DesktopBuddy { internal static class BuildInfo { internal const string GitSha = "$(GitSha)"%3B } }</BuildInfoContent>
     </PropertyGroup>
+    <WriteLinesToFile File="$(IntermediateOutputPath)BuildInfo.g.cs" Overwrite="true" Lines="$(BuildInfoContent)" />
     <ItemGroup>
-      <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
-        <_Parameter1>GitSha</_Parameter1>
-        <_Parameter2>$(GitSha)</_Parameter2>
-      </AssemblyAttribute>
+      <Compile Include="$(IntermediateOutputPath)BuildInfo.g.cs" />
     </ItemGroup>
   </Target>
 
